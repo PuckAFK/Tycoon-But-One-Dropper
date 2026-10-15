@@ -1,5 +1,5 @@
 --[[
-    PuckAFK | Tycoon, but one dropper!  [UPD 4 | v1.9.3 - Trace-Verified Halloween Fix]
+    PuckAFK | Tycoon, but one dropper!  [UPD 4 | v1.9.4 - Adaptive Performance Fix]
     Based on a static inspection of place 109949693269081, the shared Config/Gear
     modules, client controllers, and a client remote trace dated 2026-10-14.
 
@@ -68,6 +68,11 @@ local state = {
     eventLastReason = '', eventBrewCooldown = 0,
     eventOwned = {}, eventShopBackoff = {}, eventBubbling = 0,
     eventLastActionAttempt = 0, eventTraceProof = 'HalloweenBrew',
+    padCache = nil, padCachePlot = nil, padCacheAt = 0,
+    gearPlan = nil, gearPlanRef = nil, gearPlanEquipRef = nil,
+    gearPlanCalculations = 0, lastGearScanAt = 0, lastGearScanResult = nil,
+    statusCache = {}, lastUiAt = 0, lastGearRequestAt = 0,
+    gearMissCount = 0, workScans = 0,
 
     currentTask = 'Idle', lastTaskSwitch = 0, startupAt = 0,
     movementFailures = 0, characterChangedAt = 0,
@@ -288,6 +293,10 @@ end
 local function availablePads(plot)
     local padsFolder = plot and plot:FindFirstChild('Pads')
     if not padsFolder then return {} end
+    if state.padCache and state.padCachePlot == plot and
+        now() - state.padCacheAt < 0.42 then
+        return state.padCache
+    end
     local candidates = {}
     local serverTime = workspace:GetServerTimeNow()
     state.nextConstruction = nil
@@ -311,6 +320,10 @@ local function availablePads(plot)
             end
         end
     end
+    state.padCache = candidates
+    state.padCachePlot = plot
+    state.padCacheAt = now()
+    state.workScans = state.workScans + 1
     return candidates
 end
 
@@ -367,7 +380,7 @@ local function getBestPad(plot, cash, income)
     for _, item in ipairs(choices) do
         nextCost = math.min(nextCost, item.cost)
         local failedUntil = state.failures['pad:' .. item.id] or 0
-        if item.cost <= cash - reserve and failedUntil <= now() then
+        if item.part and item.part.Parent and item.cost <= cash - reserve and failedUntil <= now() then
             local score = upgradeScore(item, cash, income, root)
             -- Deterministic tie-break removes pad oscillation.
             if score > bestScore + 0.000001 or
@@ -380,6 +393,7 @@ local function getBestPad(plot, cash, income)
     return best, nextCost, #choices
 end
 
+local floor3Focus
 local function buyPad(plot, candidate)
     if not opts.AutoBuyPads or opts.ActivityPriority == 'Extras Only' then return false end
     if not candidate or not candidate.part or not candidate.part.Parent then return false end
@@ -430,6 +444,7 @@ local function buyPad(plot, candidate)
         state.failures['pad:' .. id] = nil
         state.padFailures[id] = nil
         state.lastBoughtAt = now()
+        state.padCache = nil
         return true
     end
     local fails = math.min(5, (state.padFailures[id] or 0) + 1)
@@ -439,6 +454,7 @@ local function buyPad(plot, candidate)
     -- short cooldown rather than falsely marking the upgrade as purchased.
     if changedCash then backoff = math.min(backoff, 2.5) end
     state.failures['pad:' .. id] = now() + backoff
+    state.padCache = nil
     return false
 end
 
@@ -480,7 +496,7 @@ end
 -- Optional UPD 4 showcase mode: let new floor expansions run for a short
 -- limited session when first entering each new rebirth tier. Off by default
 -- to preserve the user's fast-rebirth progression preference.
-local function floor3Focus()
+floor3Focus = function()
     if not opts.AutoBuildFloor3 or nattr('Rebirths') < 15 then return false end
     local r = nattr('Rebirths')
     if state.floorBuildRebirth ~= r then
@@ -516,6 +532,7 @@ local function rebirthTick()
     if response.ok then
         state.counters.rebirths = state.counters.rebirths + 1
         table.clear(state.failures)
+        state.padCache = nil
         state.lastPadAt = 0
         state.lastPadId = nil
         say('Rebirth completed')
@@ -618,6 +635,9 @@ local function codesTick()
 end
 
 local function lostGearTarget()
+    if now() - state.lastGearScanAt < 0.9 then return state.lastGearScanResult end
+    state.lastGearScanAt = now()
+    state.lastGearScanResult = nil
     local folder = workspace:FindFirstChild('LostGears')
     if not folder then return nil end
     local _, root = humanoidParts()
@@ -638,6 +658,7 @@ local function lostGearTarget()
             end
         end
     end
+    state.lastGearScanResult = nearest
     return nearest
 end
 
@@ -735,6 +756,7 @@ local function worldTick(allowGear, maxDetour, forceGear, forcePail)
                 -- An accepted gear stays visually visible on some clients.
                 -- Wait for refreshed GearData, or a new collection round.
                 state.worldAttempts[target.key] = now() + 90
+                state.lastGearScanAt = 0
                 state.pickupFailures[target.key] = nil
                 say('Collected lost gear #' .. tostring(target.index))
             else
@@ -1127,11 +1149,16 @@ local function bestLoadout(inventory, equipped)
         if not inventory[chosen[slot.Key]] then chosen[slot.Key] = nil end
     end
     local scoreCache = {}
+    local scoreCalls = 0
     local function scored(E)
         local keys = {}
         for _, slot in ipairs(Gear.Slots) do keys[#keys+1] = tostring(E[slot.Key] or '-') end
         local sig = table.concat(keys, '|')
-        if scoreCache[sig] == nil then scoreCache[sig] = loadoutScore(inventory, E) end
+        if scoreCache[sig] == nil then
+            scoreCalls = scoreCalls + 1
+            if scoreCalls % 24 == 0 then task.wait() end
+            scoreCache[sig] = loadoutScore(inventory, E)
+        end
         return scoreCache[sig]
     end
     -- Multiple complete sets can be compared; skip the misleading individual
@@ -1212,7 +1239,17 @@ local function autoGear()
         end
     end
     if opts.AutoEquipGear and not preserveReaper and ready('equip-gear', 5) then
-        local chosen = bestLoadout(d.I, d.E)
+        local chosen
+        if state.gearPlan and state.gearPlanRef == d.I and
+            state.gearPlanEquipRef == d.E then
+            chosen = state.gearPlan
+        else
+            chosen = bestLoadout(d.I, d.E)
+            state.gearPlan = chosen
+            state.gearPlanRef = d.I
+            state.gearPlanEquipRef = d.E
+            state.gearPlanCalculations = state.gearPlanCalculations + 1
+        end
         for _, slot in ipairs(Gear.Slots) do
             local id = chosen[slot.Key]
             if id and id ~= d.E[slot.Key] and ready('equip:' .. slot.Key, 4) then
@@ -1618,6 +1655,10 @@ if Net and Net:IsA('RemoteEvent') then
                 end
             end
             state.gear = data
+            state.gearPlan = nil
+            state.gearPlanRef = nil
+            state.gearPlanEquipRef = nil
+            state.lastGearScanAt = 0
             state.gearSnapshotAt = now()
             state.gearDirty = false
         elseif event == 'WorkerData' and type(data) == 'table' then
@@ -1641,8 +1682,10 @@ if Net and Net:IsA('RemoteEvent') then
         elseif event == 'Rebirthed' then
             state.lastRebirth = now()
             table.clear(state.failures)
+            state.padCache = nil
         elseif event == 'Bought' and type(data) == 'table' then
             if type(data.Id) == 'string' then state.padAcks[data.Id] = now() end
+            state.padCache = nil
             state.throttles['pad-cycle'] = now() + 0.12
         elseif event == 'TooPoor' then
             state.throttles['pad-cycle'] = now() + 1
@@ -1885,6 +1928,7 @@ local function runFarm()
             local candidate, nextPrice, count = getBestPad(plot, cash, income)
             if state.lastPlot ~= plot then
                 state.lastPlot = plot
+                state.padCache = nil
                 table.clear(state.padFailures)
                 table.clear(state.failures)
             end
@@ -1919,7 +1963,7 @@ local function runFarm()
             warn('[PuckAFK TBOD][Farm] ' .. tostring(err))
             task.wait(0.4)
         end
-        task.wait(0.06)
+        task.wait(0.13)
     end
 end
 -- Keep wheel spins/daily reward checks independent from slow inventory scans.
@@ -1931,7 +1975,7 @@ local function runFastRewards()
             state.lastError = tostring(err)
             warn('[PuckAFK TBOD][Fast Rewards] ' .. tostring(err))
         end
-        task.wait(0.85)
+        task.wait(1.05)
     end
 end
 
@@ -1945,7 +1989,7 @@ local function runHalloween()
             state.lastError = tostring(err)
             warn('[PuckAFK TBOD][Halloween] ' .. tostring(err))
         end
-        task.wait(0.95)
+        task.wait(1.10)
     end
 end
 local function runMaintenance()
@@ -1959,7 +2003,7 @@ local function runMaintenance()
             state.lastError = tostring(err)
             warn('[PuckAFK TBOD][Rewards] ' .. tostring(err))
         end
-        task.wait(0.22)
+        task.wait(0.38)
     end
 end
 local function runGearRefresh()
@@ -1971,13 +2015,23 @@ local function runGearRefresh()
             if now() >= (state.throttles['gear-resync'] or 0) and
                 ((state.gearDirty and elapsed >= 2.5) or (stale and elapsed >= 5)) then
                 lastRequest = now()
-                local response = rpc('GearData') -- server broadcasts GearData
-                if not response.ok then
-                    state.throttles['gear-resync'] = now() + 6
+                local before = state.gearSnapshotAt
+                local response = rpc('GearData') -- broadcast is not guaranteed
+                if not response.ok or state.gearSnapshotAt == before then
+                    state.gearMissCount = math.min(5, state.gearMissCount + 1)
+                    state.throttles['gear-resync'] = now() + math.min(40, 6 * 2 ^ (state.gearMissCount - 1))
+                else
+                    state.gearMissCount = 0
                 end
             end
         end
         task.wait(1.3)
+    end
+end
+local function setStatusLabel(label, key, value)
+    if label and state.statusCache[key] ~= value then
+        state.statusCache[key] = value
+        label:Set(value)
     end
 end
 local function runStatus()
@@ -1985,27 +2039,27 @@ local function runStatus()
         pcall(function()
             local title = state.status
             if state.lastError ~= '' then title = title .. ' | Last error: ' .. state.lastError:sub(1, 35) end
-            if stateLabel then stateLabel:Set(title) end
+            setStatusLabel(stateLabel, 'main', title)
             if statsLabel then
-                statsLabel:Set(string.format('Pads %d  |  Rebirths %s  |  Spins %d  |  Gears %d  |  Obby %d',
+                setStatusLabel(statsLabel, 'stats', string.format('Pads %d  |  Rebirths %s  |  Spins %d  |  Gears %d  |  Obby %d',
                     state.counters.purchases, fmt(nattr('Rebirths')), state.counters.spins, state.counters.gears, state.counters.obby))
             end
             if walletLabel then
-                walletLabel:Set(string.format('Cash $%s  |  Income $%s/s  |  Tokens %s',
+                setStatusLabel(walletLabel, 'wallet', string.format('Cash $%s  |  Income $%s/s  |  Tokens %s',
                     fmt(nattr('Cash')), fmt(nattr('Income')), fmt(nattr('Tokens'))))
             end
-            if eventLabel then eventLabel:Set('Halloween: ' .. tostring(state.eventStatus) ..
+            if eventLabel then setStatusLabel(eventLabel, 'event', 'Halloween: ' .. tostring(state.eventStatus) ..
                 ' | Candy ' .. fmt(nattr('Candy')) .. ' | Brews ' .. tostring(state.eventBrews) ..
                 ' | Pails ' .. tostring(state.eventPails)) end
-            if obbyLabel then obbyLabel:Set('Obby: ' .. tostring(state.obbyStatus)) end
-            if workerLabel then workerLabel:Set('Workers: ' .. (nattr('Rebirths') < Workers.Unlock and
+            if obbyLabel then setStatusLabel(obbyLabel, 'obby', 'Obby: ' .. tostring(state.obbyStatus)) end
+            if workerLabel then setStatusLabel(workerLabel, 'workers', 'Workers: ' .. (nattr('Rebirths') < Workers.Unlock and
                 ('Unlock at '..Workers.Unlock..' rebirths') or state.workersStatus)) end
             if caseLabel then
-                caseLabel:Set(string.format('Scrap %s  |  Cases %d  |  %s',
+                setStatusLabel(caseLabel, 'cases', string.format('Scrap %s  |  Cases %d  |  %s',
                     fmt(nattr('Scrap')), state.counters.cases, state.caseDecision or 'Idle'))
             end
         end)
-        task.wait(0.75)
+        task.wait(1.3)
     end
 end
 
@@ -2019,4 +2073,4 @@ task.spawn(runHalloween)
 task.spawn(runGearRefresh)
 task.spawn(runWorkerRefresh)
 task.spawn(runStatus)
-notify("v1.9.3 UPD 4 | trace-verified Cauldron, no GearData wait, Witch shop fallback")
+notify("v1.9.4 UPD 4 | faster farming + fixed pad calls + low-stutter caching")

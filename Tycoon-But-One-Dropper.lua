@@ -1,5 +1,5 @@
 --[[
-    PuckAFK | Tycoon, but one dropper!  [UPD 4 | v1.9.2 - Event Automation Fix]
+    PuckAFK | Tycoon, but one dropper!  [UPD 4 | v1.9.3 - Trace-Verified Halloween Fix]
     Based on a static inspection of place 109949693269081, the shared Config/Gear
     modules, client controllers, and a client remote trace dated 2026-10-14.
 
@@ -66,6 +66,8 @@ local state = {
     eventCandyEarned = 0, eventLastCandy = nil, eventSmartNextEarned = 0,
     eventSmartBrews = 0, eventActionFailures = 0, eventLastAction = 'None',
     eventLastReason = '', eventBrewCooldown = 0,
+    eventOwned = {}, eventShopBackoff = {}, eventBubbling = 0,
+    eventLastActionAttempt = 0, eventTraceProof = 'HalloweenBrew',
 
     currentTask = 'Idle', lastTaskSwitch = 0, startupAt = 0,
     movementFailures = 0, characterChangedAt = 0,
@@ -84,7 +86,7 @@ local opts = {
     AutoLostGears = true, AutoCrates = true, AutoPails = true,
     -- The old AutoHalloweenGear/AutoBrew values are retained for JSON profile
     -- compatibility; AutoHalloweenEvent and HalloweenGoal are the new controls.
-    AutoHalloweenGear = true, AutoBrew = false, CandyReserve = 25,
+    AutoHalloweenGear = true, AutoBrew = true, CandyReserve = 0,
     AutoHalloweenEvent = true, HalloweenGoal = 'Smart Event',
     WearReaperSet = true, StopBrewAfterCrown = true,
 
@@ -901,11 +903,15 @@ local function eventBrew(inv, candy, mode, reserve)
             :format(fmt(candy), fmt(cost + reserve), fmt(reserve))
         return false
     end
-    if not ready('witch-brew', 5) then
-        state.eventStatus = 'Cauldron ready; waiting for action cooldown'
+    if now() < state.eventBrewCooldown then
+        state.eventStatus = ('Cauldron bubbling; retry in %.1fs'):format(state.eventBrewCooldown - now())
         return false
     end
-    local oldCandy, oldPity = candy, nattr('BrewPity')
+    if not ready('witch-brew', 1.0) then
+        state.eventStatus = 'Cauldron: short action cooldown'
+        return false
+    end
+    state.eventLastActionAttempt = now()
     local result = rpc('HalloweenBrew')
     if result.ok then
         local rewardKey = tostring(result.Key or result.key or 'Reward')
@@ -914,13 +920,14 @@ local function eventBrew(inv, candy, mode, reserve)
         state.eventLastBrewAt = now()
         state.eventActionFailures = 0
         state.eventLastAction = 'Brew: ' .. rewardKey
-        state.eventNextTryAt = now() + 2.5
+        state.eventNextTryAt = now() + 2.3
+        state.eventBrewCooldown = now() + 2.3
         -- New inventory snapshots are needed after prize-gear drops.
         if rewardKey == 'Rare' or rewardKey == 'Limited' then state.gearDirty = true end
         if mode == 'Smart Event' then
             -- Only use about one fourth of newly earned candy for optional
             -- brews while saving for the permanent four-piece Reaper set.
-            state.eventSmartNextEarned = state.eventCandyEarned + cost * 3
+            state.eventSmartNextEarned = state.eventCandyEarned + cost + 40
             state.eventSmartBrews = state.eventSmartBrews + 1
         end
         state.eventStatus = ('Brew #%d succeeded: %s'):format(state.eventBrews, rewardKey)
@@ -929,9 +936,24 @@ local function eventBrew(inv, candy, mode, reserve)
     end
     -- The game returns an explicit server message. Show it rather than
     -- silently retrying the same rejected request forever.
+    local reason = tostring(result.msg or 'server did not accept the action')
+    if string.find(string.lower(reason), 'bubbling', 1, true) then
+        -- Trace shows this is a normal cauldron cooldown, not a fatal error.
+        state.eventBubbling = state.eventBubbling + 1
+        state.eventBrewCooldown = now() + 2.0
+        state.eventNextTryAt = state.eventBrewCooldown
+        state.eventStatus = 'Cauldron still bubbling; retrying after cooldown'
+        return false
+    end
+    if string.find(string.lower(reason), 'busy', 1, true) or
+        string.find(string.lower(reason), 'cooling', 1, true) then
+        state.eventNextTryAt = now() + 1
+        state.eventStatus = 'Server busy; Witch controller will retry'
+        return false
+    end
     state.eventActionFailures = math.min(6, state.eventActionFailures + 1)
-    state.eventNextTryAt = now() + math.min(90, 4 * 2 ^ (state.eventActionFailures - 1))
-    state.eventStatus = ('Brew rejected: %s'):format(tostring(result.msg or 'server did not accept the action'))
+    state.eventNextTryAt = now() + math.min(60, 3 * 2 ^ (state.eventActionFailures - 1))
+    state.eventStatus = ('Brew rejected: %s'):format(reason)
     state.lastError = 'HalloweenBrew: ' .. tostring(result.msg or 'rejected')
     return false
 end
@@ -961,25 +983,27 @@ local function halloweenTick()
         type(inv.E) == 'table' and not state.gearDirty and
         now() - state.gearSnapshotAt <= 35
     local missing, nextItem, wantedTotal = 0, nil, 0
-    if invReady then
-        for _, item in ipairs(Halloween.Shop or {}) do
-            if not inv.I[item.Id] then
+    for _, item in ipairs(Halloween.Shop or {}) do
+        if invReady and inv.I[item.Id] then state.eventOwned[item.Id] = true end
+        if not state.eventOwned[item.Id] and not (invReady and inv.I[item.Id]) then
                 missing = missing + 1
                 local price = tonumber(item.Cost) or math.huge
                 wantedTotal = wantedTotal + price
-                if not nextItem or price < (tonumber(nextItem.Cost) or math.huge) then
+                local paused = now() < (state.eventShopBackoff[item.Id] or 0)
+                if not paused and (not nextItem or price < (tonumber(nextItem.Cost) or math.huge)) then
                     nextItem = item
                 end
             end
-        end
     end
     local reserve = math.max(0, tonumber(opts.CandyReserve) or 0)
     local brewCost = tonumber(Halloween.Brew and Halloween.Brew.Cost) or 75
     local wantsShop = goal ~= 'Brew Only'
     local wantsBrew = goal ~= 'Set Only'
-    if not invReady and wantsShop then
-        state.eventStatus = 'Waiting for Witch gear inventory (GearData)'
-        return
+    -- GearData is an optional asynchronous event. Its RPC can acknowledge
+    -- ok=true without supplying a fresh inventory snapshot. The Cauldron and
+    -- Witch's Shop still work without that event, as the trace demonstrates.
+    if not invReady then
+        state.eventLastReason = 'GearData pending; using confirmed event purchases'
     end
     local needsBrew = not invReady or eventNeedsBrew(inv)
     local canBrew = wantsBrew and needsBrew and candy >= brewCost + reserve
@@ -992,6 +1016,8 @@ local function halloweenTick()
         local reply = rpc('HalloweenBuy', nextItem.Id)
         if reply.ok then
             state.eventPurchases = state.eventPurchases + 1
+            state.eventOwned[nextItem.Id] = true
+            state.eventShopBackoff[nextItem.Id] = nil
             state.eventLastBuyAt = now()
             state.eventActionFailures = 0
             state.gearDirty = true
@@ -1000,10 +1026,18 @@ local function halloweenTick()
                 tostring((Gear.ById[nextItem.Id] and Gear.ById[nextItem.Id].Name) or nextItem.Id)
             say("Witch's Hut: " .. state.eventStatus)
         else
-            state.eventActionFailures = math.min(6, state.eventActionFailures + 1)
-            state.eventNextTryAt = now() + math.min(75, 4 * 2 ^ (state.eventActionFailures - 1))
-            state.eventStatus = 'Witch shop rejected: ' .. tostring(reply.msg or 'server declined purchase')
-            state.lastError = 'HalloweenBuy: ' .. tostring(reply.msg or 'rejected')
+            local reason = tostring(reply.msg or 'server declined purchase')
+            if string.find(string.lower(reason), 'already', 1, true) or
+                string.find(string.lower(reason), 'own', 1, true) then
+                state.eventOwned[nextItem.Id] = true
+                state.eventStatus = 'Already owned: ' .. tostring(nextItem.Id)
+                state.eventNextTryAt = now() + 1
+            else
+                state.eventShopBackoff[nextItem.Id] = now() + 15
+                state.eventNextTryAt = now() + 2
+                state.eventStatus = 'Witch shop: ' .. reason
+                state.lastError = 'HalloweenBuy: ' .. reason
+            end
         end
         return
     end
@@ -1036,7 +1070,7 @@ local function halloweenTick()
         -- Avoid spending the final 75 candy immediately before a shop item.
         local gap = nextItem and (tonumber(nextItem.Cost) - candy) or math.huge
         local enoughNewCandy = state.eventCandyEarned >= state.eventSmartNextEarned
-        local enoughTime = now() - state.eventLastBrewAt >= 20
+        local enoughTime = state.eventLastBrewAt == 0 or now() - state.eventLastBrewAt >= 2.3
         smartAllowsBrew = gap > brewCost and enoughNewCandy and enoughTime
     end
     if canBrew and smartAllowsBrew then
@@ -1985,4 +2019,4 @@ task.spawn(runHalloween)
 task.spawn(runGearRefresh)
 task.spawn(runWorkerRefresh)
 task.spawn(runStatus)
-notify("v1.9.2 UPD 4 | Witch brewing fixed + event worker + smart candy budget")
+notify("v1.9.3 UPD 4 | trace-verified Cauldron, no GearData wait, Witch shop fallback")

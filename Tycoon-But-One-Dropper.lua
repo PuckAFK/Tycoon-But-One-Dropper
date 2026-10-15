@@ -1,5 +1,5 @@
 --[[
-    PuckAFK | Tycoon, but one dropper!  [UPD 4 | v1.9 - Halloween Polished]
+    PuckAFK | Tycoon, but one dropper!  [UPD 4 | v1.9.1 - Core Reliability Hotfix]
     Based on a static inspection of place 109949693269081, the shared Config/Gear
     modules, client controllers, and a client remote trace dated 2026-10-14.
 
@@ -63,6 +63,9 @@ local state = {
     eventLastBrewAt = 0, eventPailLastAt = 0,
     eventLuckSwaps = 0, eventRestores = 0, eventRestoreFailures = 0,
     eventLastGearSnapshot = 0, eventNextRestore = 0,
+    currentTask = 'Idle', lastTaskSwitch = 0, startupAt = 0,
+    movementFailures = 0, characterChangedAt = 0,
+    failedActions = {}, rebirthBlockedUntil = 0,
 
 
     status = 'Initialising', lastError = '',
@@ -217,41 +220,57 @@ local function canGo()
     return state.alive and hum ~= nil and root ~= nil
 end
 local function moveNear(targetPos, maxDistance, yOffset)
-    if not state.alive or typeof(targetPos) ~= 'Vector3' or state.moving then return false end
+    if not state.alive or typeof(targetPos) ~= 'Vector3' then return false end
+    if state.moving then
+        -- A previous movement may have been interrupted by respawn, streaming
+        -- or an executor tween error. Never leave the farm locked forever.
+        if now() - (state.movementStarted or 0) < 7 then return false end
+        if state.tween then pcall(function() state.tween:Cancel() end) end
+        state.moving, state.tween = false, nil
+    end
     local hum, root = humanoidParts()
     if not hum or not root then return false end
-    local dest = targetPos + Vector3.new(0, yOffset or 2.8, 0)
-    local dist = (root.Position - dest).Magnitude
+    local destination = targetPos + Vector3.new(0, yOffset or 2.8, 0)
+    local dist = (root.Position - destination).Magnitude
     if dist <= (maxDistance or 3) then return true end
     state.moving = true
+    state.movementStarted = now()
     local arrived = false
-    if opts.Movement == 'Tween' then
-        local speed = math.clamp(tonumber(opts.TweenSpeed) or 175, 80, 400)
-        local duration = dist / speed
-        local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear),
-            {CFrame = CFrame.new(dest)})
-        state.tween = tween
-        tween:Play()
-        local deadline = now() + duration + 0.5
-        while state.alive and state.tween == tween and now() < deadline do
-            if tween.PlaybackState ~= Enum.PlaybackState.Playing then break end
-            if not canGo() then break end
-            task.wait(0.045)
+    local moved, err = pcall(function()
+        if opts.Movement == 'Tween' then
+            local speed = math.clamp(tonumber(opts.TweenSpeed) or 175, 80, 400)
+            local duration = dist / speed
+            local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear),
+                {CFrame = CFrame.new(destination)})
+            state.tween = tween
+            tween:Play()
+            local deadline = now() + math.min(duration + 0.6, 7)
+            while state.alive and state.tween == tween and now() < deadline do
+                if tween.PlaybackState ~= Enum.PlaybackState.Playing or not canGo() then break end
+                task.wait(0.05)
+            end
+            if tween.PlaybackState == Enum.PlaybackState.Playing then tween:Cancel() end
+        else
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.CFrame = CFrame.new(destination)
+            task.wait(0.10)
         end
-        if tween.PlaybackState == Enum.PlaybackState.Playing then tween:Cancel() end
-        if state.tween == tween then state.tween = nil end
-        local _, newRoot = humanoidParts()
-        arrived = state.alive and newRoot ~= nil and (newRoot.Position - dest).Magnitude <= 7
+        local _, nextRoot = humanoidParts()
+        arrived = state.alive and nextRoot ~= nil and
+            (nextRoot.Position - destination).Magnitude <= math.max(7, maxDistance or 3)
+    end)
+    if state.tween then pcall(function() state.tween:Cancel() end) end
+    state.tween, state.moving = nil, false
+    if not moved then
+        state.movementFailures = state.movementFailures + 1
+        state.lastError = 'Movement: ' .. tostring(err)
+    elseif arrived then
+        state.busyUntil = now() + 0.12
+        state.movementFailures = 0
     else
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        root.CFrame = CFrame.new(dest)
-        task.wait(0.055)
-        local _, newRoot = humanoidParts()
-        arrived = state.alive and newRoot ~= nil and (newRoot.Position - dest).Magnitude <= 7
+        state.movementFailures = state.movementFailures + 1
     end
-    state.moving = false
-    if arrived then state.busyUntil = now() + 0.12 end
     return arrived
 end
 
@@ -362,7 +381,8 @@ local function buyPad(plot, candidate)
     local part, id = candidate.part, candidate.id
     -- Preserve cash for the selected token goal once the basic rebirth is affordable.
     if id ~= 'Start' and opts.AutoRebirth and nattr('RebirthCost') > 0 and
-        nattr('Cash') >= nattr('RebirthCost') and not floor3Focus() then return false end
+        nattr('Cash') >= nattr('RebirthCost') and not floor3Focus() and
+        now() >= (state.rebirthBlockedUntil or 0) then return false end
     if part:GetAttribute('Item') ~= id then return false end
     if id ~= 'Start' and padPrice(part) > nattr('Cash') then return false end
     if (tonumber(part:GetAttribute('BuildT')) or 0) > workspace:GetServerTimeNow() then return false end
@@ -384,7 +404,8 @@ local function buyPad(plot, candidate)
         end)
     end
     if state.alive and part.Parent and part:IsDescendantOf(plot) then
-        root.CFrame = CFrame.new(top + Vector3.new(0, 2.2, 0))
+        root.CFrame = CFrame.new(top + Vector3.new(0, 1.0, 0))
+        task.wait(0.13)
     end
     local limit = now() + math.clamp(opts.PadDelay / 100, 0.15, 1.0)
     repeat
@@ -496,6 +517,10 @@ local function rebirthTick()
         return true
     end
     state.lastError = tostring(response.msg or 'Rebirth was not accepted')
+    -- Server can reject a rebirth even when the client has enough cash.
+    -- Resume factory work temporarily rather than indefinitely saving.
+    state.rebirthBlockedUntil = now() + 12
+    state.throttles['rebirth-scan'] = now() + 3
     return false
 end
 
@@ -681,7 +706,7 @@ local function worldTick(allowGear, maxDetour, forceGear, forcePail)
     say('Collecting ' .. (target.kind == 'crate' and 'mystery crate' or
         target.kind == 'pail' and 'candy pail' or 'lost gear'))
     local ackBefore = state.worldAcks[target.key] or 0
-    local moved = moveNear(target.pos, 4.5, 1.1)
+    local moved = moveNear(target.pos, 3, 0.6)
     if not moved then
         local failures = math.min(5, (state.pickupFailures[target.key] or 0) + 1)
         state.pickupFailures[target.key] = failures
@@ -694,7 +719,7 @@ local function worldTick(allowGear, maxDetour, forceGear, forcePail)
         -- calls Action('LostGear', index) after approaching the Spot.
         -- Merely teleporting to the model does NOT collect the reward.
         local _, root = humanoidParts()
-        if root and (root.Position - target.pos).Magnitude <= 9 then
+        if root and (root.Position - target.pos).Magnitude < 5.9 then
             local result = rpc('LostGear', target.index)
             succeeded = result.ok == true
             if succeeded then
@@ -1510,7 +1535,7 @@ local okUI, loadedUI = pcall(function()
     return loadstring(source)()
 end)
 if not okUI or type(loadedUI) ~= 'table' then
-    warn('[PuckAFK TBOD] PuckUI could not load: ' .. tostring(loadedUI))
+    warn('[PuckAFK TBOD] UI load failed. Check executor HttpGet/loadstring permissions: ' .. tostring(loadedUI))
     state.alive = false
     cleanConns()
     if Env.PuckTBOD31 == state then Env.PuckTBOD31 = nil end
@@ -1687,7 +1712,7 @@ local function runFarm()
     while state.alive do
         local ok, err = pcall(function()
             if not opts.AutoFarm then
-                say('Autofarm paused')
+                say('Autofarm OFF (check saved Configs / Autofarm toggle)')
                 task.wait(0.35)
                 return
             end
@@ -1726,9 +1751,9 @@ local function runFarm()
             if opts.AutoRebirth then
                 local cost = nattr('RebirthCost')
                 local cash = nattr('Cash')
-                if cost > 0 and cash >= cost and not floor3Focus() then
-                    local multiple = opts.RebirthMode == 'Extra Tokens' and 4 or
-                        opts.RebirthMode == 'Balanced' and 2 or 1
+                if cost > 0 and cash >= cost and not floor3Focus() and
+                    now() >= (state.rebirthBlockedUntil or 0) then
+                    local multiple = rebirthMultiplier()
                     -- If we have enough for the base rebirth but want more tokens,
                     -- upgrade buying must pause, NOT the whole autofarm.
                     idleToExtras('Saving for rebirth: $' .. fmt(cash) .. '/$' .. fmt(cost * multiple))
@@ -1743,7 +1768,7 @@ local function runFarm()
                 table.clear(state.padFailures)
                 table.clear(state.failures)
             end
-            if candidate then
+            if candidate and opts.AutoBuyPads and opts.ActivityPriority ~= 'Extras Only' then
                 -- Pad cooldown is only 0.1s. Don't leave for a distant gear
                 -- between two normal consecutive successful purchases.
                 if not ready('pad-cycle', 0.10) then
@@ -1810,9 +1835,13 @@ local function runGearRefresh()
         if opts.AutoEquipGear or opts.AutoImproveGear or opts.AutoFuseGear or opts.AutoCases or opts.AutoLostGears or opts.AutoHalloweenEvent or opts.AutoSalvage then
             local elapsed = now() - lastRequest
             local stale = not state.gear or now() - state.gearSnapshotAt > 25
-            if (state.gearDirty and elapsed >= 2.5) or (stale and elapsed >= 5) then
+            if now() >= (state.throttles['gear-resync'] or 0) and
+                ((state.gearDirty and elapsed >= 2.5) or (stale and elapsed >= 5)) then
                 lastRequest = now()
-                rpc('GearData') -- server sends GearData on Net.OnClientEvent
+                local response = rpc('GearData') -- server broadcasts GearData
+                if not response.ok then
+                    state.throttles['gear-resync'] = now() + 6
+                end
             end
         end
         task.wait(1.3)
@@ -1856,4 +1885,4 @@ task.spawn(runMaintenance)
 task.spawn(runGearRefresh)
 task.spawn(runWorkerRefresh)
 task.spawn(runStatus)
-notify("v1.9 UPD 4 | polished Halloween + protected Reaper restoration + smarter cases")
+notify("v1.9.1 UPD 4 | core recovery, rebirth/pad fixes, reliable gear collection")

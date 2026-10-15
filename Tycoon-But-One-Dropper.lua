@@ -1,3 +1,15 @@
+--[[
+    PuckAFK | Tycoon, but one dropper!  [UPD 4 | v1.9 - Halloween Polished]
+    Based on a static inspection of place 109949693269081, the shared Config/Gear
+    modules, client controllers, and a client remote trace dated 2026-10-14.
+
+    IMPORTANT: Live server logic is not present in a client-side place dump.
+    Server-side pad purchases, purchase confirmations, reward cooldowns and
+    gear changes therefore need validation during an actual game session.
+
+    No premium/Robux remotes are used. Uses the game's existing Action remote
+    and legitimate near-pad/near-collectible movement where relevant.
+--]]
 
 if game.PlaceId ~= 109949693269081 then
     warn('[PuckAFK TBOD] Wrong place. Expected 109949693269081.')
@@ -17,6 +29,8 @@ end
 
 local Config = require(RS:WaitForChild('Shared'):WaitForChild('Config'))
 local Gear = require(RS.Shared:WaitForChild('Gear'))
+local Workers = require(RS.Shared:WaitForChild('Workers')) -- UPD 4 Hiring Agency
+local Halloween = require(RS.Shared:WaitForChild('Halloween')) -- Witch's Hut 2026 event
 local Remotes = RS:WaitForChild('Remotes')
 local Action = Remotes:WaitForChild('Action')
 local Net = Remotes:FindFirstChild('Net')
@@ -40,19 +54,37 @@ local state = {
     lastGearAttempt = 0, lastWorldActivity = 0, nextIdleCollectAt = 0,
     lastPrioritySwitchAt = 0, idleSince = 0, fallbackCount = 0,
     pickupFailures = {}, idleSkippedExtras = 0, extrasJobs = 0,
+    workers = nil, workersDirty = true, workersSnapshotAt = 0, workersStatus = 'Locked',
+    workerFailures = 0, workerCases = 0, workerEquips = 0, workerUpgrades = 0,
+    floorBuildUntil = 0, floorBuildRebirth = -1,
+    eventStatus = 'Waiting for event', eventBrews = 0, eventPurchases = 0,
+    eventPails = 0, eventSetEquips = 0, eventBrewResults = {},
+    eventNextTryAt = 0, eventFailures = 0, eventLastBuyAt = 0,
+    eventLastBrewAt = 0, eventPailLastAt = 0,
+    eventLuckSwaps = 0, eventRestores = 0, eventRestoreFailures = 0,
+    eventLastGearSnapshot = 0, eventNextRestore = 0,
+
+
     status = 'Initialising', lastError = '',
 }
 Env.PuckTBOD31 = state
 
 local opts = {
     AutoFarm = true, AutoBuyPads = true, ActivityPriority = 'Balanced',
-    ExtrasInterval = 15, AutoObby = true,
+    ExtrasInterval = 15, AutoObby = true, AutoBuildFloor3 = false,
     AutoRebirth = true, AutoPerks = true,
     AutoRewards = true, AutoQuests = true, AutoCodes = true, AutoGroupReward = true,
     AutoLostGears = true, AutoCrates = true, AutoPails = true,
+    -- The old AutoHalloweenGear/AutoBrew values are retained for JSON profile
+    -- compatibility; AutoHalloweenEvent and HalloweenGoal are the new controls.
     AutoHalloweenGear = true, AutoBrew = false, CandyReserve = 100,
+    AutoHalloweenEvent = true, HalloweenGoal = 'Set then Brew',
+    WearReaperSet = true, StopBrewAfterCrown = true,
+
     AutoEquipGear = true, AutoImproveGear = true, AutoFuseGear = true,
-    AutoCases = true,
+    AutoCases = true, AutoCaseLuck = true,
+    AutoWorkers = true, AutoHireWorkers = true, AutoUpgradeWorkers = true,
+    WorkerCaseType = 'Smart', WorkerTokenReserve = 30,
     CaseType = 'Smart', CaseReserve = 20,
     RebirthMode = 'Smart', BuyMode = 'Balanced',
     Movement = 'Instant', TweenSpeed = 175,
@@ -278,6 +310,12 @@ local function upgradeScore(c, cash, income, root)
         gain = math.max(gain, cat == 'S' and 1.6 or 2)
     end
     if cat == 'B' then gain = math.max(gain, 1.07) end
+    -- UPD 4: Sky Pier (row 9) and Star Station (row 12) unlock
+    -- additional production sections at rebirths 15-19. When a live
+    -- expansion pad is affordable, prefer opening a whole new section.
+    if cat == 'F' and tonumber(item.SkyRows) and item.SkyRows >= 9 then
+        gain = math.max(gain, 3.1)
+    end
     -- Purchase-pad prices can vary after discounts. Score by the live cost.
     -- Important: don't let an unaffordable expensive expansion stop cheap upgrades.
     local budget = math.max(1, tonumber(income) or 0)
@@ -324,7 +362,7 @@ local function buyPad(plot, candidate)
     local part, id = candidate.part, candidate.id
     -- Preserve cash for the selected token goal once the basic rebirth is affordable.
     if id ~= 'Start' and opts.AutoRebirth and nattr('RebirthCost') > 0 and
-        nattr('Cash') >= nattr('RebirthCost') then return false end
+        nattr('Cash') >= nattr('RebirthCost') and not floor3Focus() then return false end
     if part:GetAttribute('Item') ~= id then return false end
     if id ~= 'Start' and padPrice(part) > nattr('Cash') then return false end
     if (tonumber(part:GetAttribute('BuildT')) or 0) > workspace:GetServerTimeNow() then return false end
@@ -379,7 +417,8 @@ end
 
 local perkPriority = {'Value', 'Rate', 'Starter', 'Bargain', 'Cash', 'Conveyor',
     'Rush', 'Momentum', 'Tokens', 'Gold', 'Mystery', 'Shrine', 'Crates',
-    'Spins', 'Jackpot', 'Scrap', 'Speed', 'Offline', 'LongShift'}
+    'Spins', 'Jackpot', 'Scrap', 'Speed', 'Offline', 'LongShift',
+    'CatchUp', 'LuckyFinds', 'TowerChamp', 'Jubilee', 'NightCrew'}
 local function buyPerk()
     if not opts.AutoPerks or not ready('perk', 1.5) then return end
     -- Actual balance is Tokens, not Perk_Tokens; latter is a bool for the Token perk.
@@ -411,6 +450,18 @@ local function buyPerk()
     end
 end
 
+-- Optional UPD 4 showcase mode: let new floor expansions run for a short
+-- limited session when first entering each new rebirth tier. Off by default
+-- to preserve the user's fast-rebirth progression preference.
+local function floor3Focus()
+    if not opts.AutoBuildFloor3 or nattr('Rebirths') < 15 then return false end
+    local r = nattr('Rebirths')
+    if state.floorBuildRebirth ~= r then
+        state.floorBuildRebirth = r
+        state.floorBuildUntil = now() + 75
+    end
+    return now() < state.floorBuildUntil
+end
 local function rebirthMultiplier()
     if opts.RebirthMode == 'Extra Tokens' then return 4 end
     if opts.RebirthMode == 'Balanced' then return 2 end
@@ -426,6 +477,7 @@ local function rebirthMultiplier()
 end
 local function rebirthTick()
     if not opts.AutoFarm or not opts.AutoRebirth or not ready('rebirth-scan', 0.55) then return false end
+    if floor3Focus() then return false end
     local cost = nattr('RebirthCost')
     local cash = nattr('Cash')
     local target = cost * rebirthMultiplier()
@@ -516,9 +568,8 @@ local function rewardsTick()
 end
 local function codesTick()
     if not opts.AutoCodes or not ready('codes', 30) then return end
-    -- The first three come from the uploaded Config; the other three are
-    -- publicly listed older free codes, and may have expired in newer servers.
-    local all = {'UPDATE3', 'HALLOWEEN', 'GEAR', 'BOOST', 'FREE', 'RELEASE'}
+    -- UPD 4 adds WORKERS, UPDATE4 and 1MILVISITS. Other codes may expire.
+    local all = {'WORKERS','UPDATE4','1MILVISITS','BOOST','FREE','RELEASE'}
     for code in pairs(Config.Codes or {}) do
         local exists = false
         for _, value in ipairs(all) do if value == code then exists = true break end end
@@ -566,7 +617,7 @@ local function pickupCenter(model)
     return first and first.Position or model:GetPivot().Position
 end
 
-local function worldTarget(allowGear, maxDetour, forceGear)
+local function worldTarget(allowGear, maxDetour, forceGear, forcePail)
     if state.moving then return nil end
     local _, root = humanoidParts()
     if not root then return nil end
@@ -600,14 +651,29 @@ local function worldTarget(allowGear, maxDetour, forceGear)
     end
     -- A continuous supply of crates can otherwise prevent lost-gear rounds.
     -- Give gears an explicit service slot every 12 seconds when available.
+    if forcePail then
+        for _, candidate in ipairs(targets) do
+            if candidate.kind == 'pail' and
+                (root.Position - candidate.pos).Magnitude <= maxDetour then
+                return candidate
+            end
+        end
+        return nil
+    end
     if forceGear then return gearChoice end
+    if opts.AutoPails and workspace:GetAttribute('HalloweenOn') == true then
+        for _, candidate in ipairs(targets) do
+            if candidate.kind == 'pail' and
+                (root.Position - candidate.pos).Magnitude <= maxDetour then return candidate end
+        end
+    end
     if gearChoice and now() - state.lastGearAttempt >= 10 then return gearChoice end
     return best
 end
 
-local function worldTick(allowGear, maxDetour, forceGear)
+local function worldTick(allowGear, maxDetour, forceGear, forcePail)
     if not state.alive or not canGo() or now() < state.busyUntil then return false end
-    local target = worldTarget(allowGear, maxDetour, forceGear)
+    local target = worldTarget(allowGear, maxDetour, forceGear, forcePail)
     if not target then return false end
     if target.kind == 'gear' then state.lastGearAttempt = now() end
     local delay = target.kind == 'gear' and 4 or 3
@@ -664,7 +730,12 @@ local function worldTick(allowGear, maxDetour, forceGear)
             state.worldAttempts[target.key] = now() + math.min(90, 7 * 2 ^ (failures - 1))
         end
     end
-    if succeeded then state.extrasJobs = state.extrasJobs + 1 end
+    if succeeded then
+        state.extrasJobs = state.extrasJobs + 1
+        if target.kind == 'pail' then
+            state.eventStatus = 'Collected Halloween candy pail'
+        end
+    end
     state.lastWorldActivity = now()
     return true -- an attempted collectible trip is useful work, including failed/denied trips
 end
@@ -754,35 +825,135 @@ local function obbyTick()
     return true
 end
 
+-- New Witch's Hut controller, sourced from Shared.Halloween and HalloweenUI.
+-- Candy comes from pumpkins on the conveyor, pails, rebirths and playtime;
+-- server-side production is automatic and must not be spoofed.
+local function eventOn()
+    return Halloween and Halloween.On() and workspace:GetAttribute('HalloweenOn') == true
+end
+local function reaperOwned(snapshot)
+    if not snapshot or type(snapshot.I) ~= 'table' then return false end
+    local set = Gear.SetByKey and Gear.SetByKey.Reaper
+    if not set then return false end
+    for _, id in ipairs(set.Pieces or {}) do
+        if not snapshot.I[id] then return false end
+    end
+    return true
+end
+local function eventNeedsBrew(snapshot)
+    if not snapshot or type(snapshot.I) ~= 'table' then return true end
+    local limited = Halloween.Brew and Halloween.Brew.Limited
+    local rare = Halloween.Brew and Halloween.Brew.Rare
+    -- Complete BOTH unique brew prizes. A lucky early Crown should not
+    -- strand the Mummy Wraps pity reward unfinished.
+    if opts.StopBrewAfterCrown and limited and rare and
+        snapshot.I[limited] and snapshot.I[rare] then return false end
+    return true
+end
 local function halloweenTick()
-    if not (opts.AutoHalloweenGear or opts.AutoBrew) or not ready('halloween', 12) then return end
-    if workspace:GetAttribute('HalloweenOn') ~= true then return end
+    if not opts.AutoHalloweenEvent or not state.alive then return end
+    if not eventOn() then
+        state.eventStatus = 'Event is currently inactive'
+        return
+    end
+    if now() < state.eventNextTryAt or not ready('event-plan', 2.5) then return end
+    local inv = state.gear
+    local goal = opts.HalloweenGoal
     local candy = nattr('Candy')
-    local hModule = RS.Shared:FindFirstChild('Halloween')
-    if not hModule then return end
-    local Halloween = require(hModule)
-    local inv = state.gear and state.gear.I or nil
-    if opts.AutoHalloweenGear and type(inv) == 'table' and type(Halloween.Shop) == 'table' then
-        for _, item in ipairs(Halloween.Shop) do
-            if not inv[item.Id] and candy >= (tonumber(item.Cost) or math.huge)
-                and ready('halloween-buy:' .. tostring(item.Id), 25) then
-                local res = rpc('HalloweenBuy', item.Id)
-                if res.ok then
-                    state.gearDirty = true
-                    say('Bought permanent Halloween gear: ' .. item.Id)
-                    return
-                end
-                state.throttles['halloween-buy:' .. tostring(item.Id)] = now() + 90
+    if not inv or type(inv.I) ~= 'table' or type(inv.E) ~= 'table' or
+        state.gearDirty or now() - state.gearSnapshotAt > 24 then
+        state.eventStatus = 'Refreshing Witch gear inventory'
+        return
+    end
+    local missing, nextItem, wantedTotal = 0, nil, 0
+    for _, item in ipairs(Halloween.Shop or {}) do
+        if not inv.I[item.Id] then
+            missing = missing + 1
+            wantedTotal = wantedTotal + (tonumber(item.Cost) or 0)
+            if not nextItem or (tonumber(item.Cost) or math.huge) < nextItem.Cost then
+                nextItem = item
             end
         end
     end
-    if opts.AutoBrew then
-        local cost = Halloween.Brew and tonumber(Halloween.Brew.Cost) or math.huge
-        if candy >= cost + opts.CandyReserve then
-            local res = rpc('HalloweenBrew')
-            if res.ok then say('Made Halloween brew') end
+    local shopFirst = goal == 'Set then Brew' or goal == 'Set Only' or
+        (goal == 'Brew First' and not eventNeedsBrew(inv))
+    local buyEventGear = goal ~= 'Brew Only'
+    local doBrew = goal ~= 'Set Only'
+    if buyEventGear and missing > 0 and (shopFirst or candy < (Halloween.Brew.Cost or 75)) then
+        -- Buy only *unowned* event items, in ascending cost order. Never spend
+        -- any candy reserved for an affordable missing Reaper item on brews.
+        if nextItem and candy >= nextItem.Cost then
+            if not ready('witch-buy:' .. nextItem.Id, 5) then return end
+            local reply = rpc('HalloweenBuy', nextItem.Id)
+            if reply.ok then
+                state.eventPurchases = state.eventPurchases + 1
+                state.eventLastBuyAt = now()
+                state.eventFailures = 0
+                state.gearDirty = true
+                state.eventLastGearSnapshot = state.gearSnapshotAt
+                state.eventNextTryAt = now() + 2.7
+                state.eventStatus = 'Purchased ' .. (Gear.ById[nextItem.Id] and Gear.ById[nextItem.Id].Name or nextItem.Id) ..
+                    ' (' .. (4 - missing + 1) .. '/4)'
+                say("Witch's Hut: " .. state.eventStatus)
+            else
+                state.eventFailures = math.min(5, state.eventFailures + 1)
+                state.eventNextTryAt = now() + math.min(90, 6 * 2 ^ (state.eventFailures - 1))
+                state.eventStatus = 'Event purchase rejected; retrying later'
+            end
+        else
+            state.eventStatus = ('Saving candy for Reaper (%s/%s next; %s total remaining)')
+                :format(fmt(candy), fmt(nextItem and nextItem.Cost or 0), fmt(wantedTotal))
+        end
+        return
+    end
+    if missing == 0 and opts.WearReaperSet and reaperOwned(inv) then
+        local equipped = Gear.Total({I = inv.I, E = inv.E})
+        if not (equipped.Sets and equipped.Sets.Reaper) and ready('witch-set', 8) then
+            local result = rpc('GearEquipSet', 'Reaper')
+            if result.ok then
+                state.eventSetEquips = state.eventSetEquips + 1
+                state.gearDirty = true
+                state.eventNextTryAt = now() + 2.6
+                state.eventStatus = 'Equipped Reaper: +40% candy'
+            else
+                state.throttles['witch-set'] = now() + 25
+            end
+            return
         end
     end
+    if doBrew and eventNeedsBrew(inv) then
+        local cost = tonumber(Halloween.Brew and Halloween.Brew.Cost) or 75
+        local reserve = math.max(0, tonumber(opts.CandyReserve) or 0)
+        -- In Brew First mode, preserve the explicitly requested reserve only.
+        -- In Set then Brew mode, all shop items must already be owned.
+        if candy < cost + reserve then
+            state.eventStatus = ('Saving for brew (%s/%s candy, pity %s/%s)')
+                :format(fmt(candy), fmt(cost + reserve), fmt(nattr('BrewPity')),
+                    fmt(Halloween.Brew.Pity or 15))
+            return
+        end
+        if not ready('witch-brew', 6) then return end
+        local result = rpc('HalloweenBrew')
+        if result.ok then
+            local rewardKey = tostring(result.Key or 'Unknown')
+            state.eventBrewResults[rewardKey] = (state.eventBrewResults[rewardKey] or 0) + 1
+            state.eventBrews = state.eventBrews + 1
+            state.eventLastBrewAt = now()
+            state.eventFailures = 0
+            state.eventNextTryAt = now() + 3.5
+            if rewardKey == 'Rare' or rewardKey == 'Limited' then state.gearDirty = true end
+            state.eventStatus = ('Brew #%d: %s'):format(state.eventBrews, rewardKey)
+            say("Witch's Hut: " .. state.eventStatus)
+        else
+            state.eventFailures = math.min(5, state.eventFailures + 1)
+            state.eventNextTryAt = now() + math.min(90, 6 * 2 ^ (state.eventFailures - 1))
+            state.eventStatus = 'Cauldron rejected request; cooling down'
+        end
+        return
+    end
+    state.eventStatus = not eventNeedsBrew(inv) and 'Mummy Wraps + Pumpkin King obtained; brew complete'
+        or (missing == 0 and 'Reaper complete; event goals reached' or
+           ('Saving event gear (%d pieces remaining)'):format(missing))
 end
 
 local gearWeights = {Cash=3, Drop=3, Luck=15, Double=2.5,
@@ -876,7 +1047,26 @@ local function autoGear()
     if not (opts.AutoEquipGear or opts.AutoImproveGear or opts.AutoFuseGear) then return end
     if not state.gear or type(state.gear.I) ~= 'table' or type(state.gear.E) ~= 'table' then return end
     local d = state.gear
-    if opts.AutoEquipGear and ready('equip-gear', 5) then
+    local preserveReaper = opts.AutoHalloweenEvent and opts.WearReaperSet and
+        eventOn() and reaperOwned(d)
+    if preserveReaper then
+        local worn = Gear.Total({I = d.I, E = d.E})
+        if not (worn.Sets and worn.Sets.Reaper) then
+            if ready('event-set-equip', 8) and not state.gearDirty then
+                local result = rpc('GearEquipSet', 'Reaper')
+                if result.ok then
+                    state.gearDirty = true
+                    state.eventSetEquips = state.eventSetEquips + 1
+                    state.eventStatus = 'Wearing full Reaper set (+40% candy)'
+                    state.eventNextRestore = now() + 3
+                else
+                    state.throttles['event-set-equip'] = now() + 24
+                end
+            end
+            return
+        end
+    end
+    if opts.AutoEquipGear and not preserveReaper and ready('equip-gear', 5) then
         local chosen = bestLoadout(d.I, d.E)
         for _, slot in ipairs(Gear.Slots) do
             local id = chosen[slot.Key]
@@ -991,6 +1181,9 @@ local function decideToolbox()
         elseif distinct < 10 and highGrade < 2 then
             key = 'Scrap'
             reason = string.format('Build affordable collection (%d owned)', distinct)
+        elseif distinct >= 15 and highGrade >= 4 and Gear.CaseByKey.Grinder then
+            key = 'Grinder'
+            reason = 'Seeking UPD 4 exclusive Grinder gear'
         else
             key = 'Forge'
             reason = 'Saving for higher-rarity gear'
@@ -1055,9 +1248,46 @@ local function caseTick()
         return
     end
     if not ready('case-open', 5) then return end
-    -- Perform exactly one case purchase and request new inventory before
-    -- considering another. This prevents spending from a stale Scrap balance.
+    -- UPD 4 added CaseLuck. Equip a lucky set only during a toolbox opening,
+    -- then restore the best farming set; never buy the paid 2x Luck product.
+    local changedForLuck = false
+    local restoreReaper = opts.AutoHalloweenEvent and opts.WearReaperSet and
+        eventOn() and reaperOwned(state.gear)
+    if opts.AutoCaseLuck and opts.AutoEquipGear and state.gear and
+        type(state.gear.I) == 'table' and type(state.gear.E) == 'table' then
+        local best = Gear.Best(state.gear, 'Luck')
+        local prev = Gear.Total({I = state.gear.I, E = state.gear.E}).Stats.CaseLuck or 0
+        local improved = Gear.Total({I = state.gear.I, E = best}).Stats.CaseLuck or 0
+        -- When collecting event candy, only interrupt the full Reaper bonus
+        -- for a substantial case and a meaningful luck improvement.
+        local minDelta = restoreReaper and 10 or 0.1
+        local worthwhile = not restoreReaper or case.Cost >= 150
+        if worthwhile and improved - prev >= minDelta then
+            local luck = rpc('GearEquipBest', 'Luck')
+            if luck.ok then
+                changedForLuck = true
+                state.eventLuckSwaps = state.eventLuckSwaps + 1
+                state.gearDirty = true
+                task.wait(0.25)
+            end
+        end
+    end
+    -- Each case is purchased once against a current inventory snapshot.
     local result = rpc('OpenCase', case.Key)
+    if changedForLuck and state.alive then
+        -- If Reaper was active, restore the exact four pieces, not a
+        -- best-cash loadout that breaks the 40% candy set bonus.
+        local restored = restoreReaper and rpc('GearEquipSet', 'Reaper')
+            or rpc('GearEquipBest')
+        if restored.ok then
+            state.eventRestores = state.eventRestores + 1
+            state.gearDirty = true
+        else
+            state.eventRestoreFailures = state.eventRestoreFailures + 1
+            state.gearDirty = true
+            state.eventNextRestore = now() + 3
+        end
+    end
     if result.ok then
         state.counters.cases = state.counters.cases + 1
         state.lastCaseOpenedAt = now()
@@ -1073,6 +1303,156 @@ local function caseTick()
         local delay = math.min(120, 8 * (2 ^ (state.caseFailures - 1)))
         state.throttles['case-open'] = now() + delay
         state.caseDecision = 'Toolbox waiting: ' .. tostring(result.msg or 'server rejected action')
+    end
+end
+
+-- UPD 4: workers are permanent team bonuses purchased with rebirth tokens.
+-- Two free slots unlock at 50 rebirths. The third is Robux and excluded.
+local function workerScore(item, owned)
+    local lvl = type(owned) == 'table' and tonumber(owned.L) or 1
+    local stats = Workers.StatsAt(item, lvl or 1)
+    -- Token workers accelerate worker/ perk progression; cash workers speed up
+    -- rebirths; Scrap workers fund gear and toolbox progression.
+    return (stats.Tokens or 0) * 5 + (stats.Cash or 0) * 2.5 + (stats.Scrap or 0) * 1.8
+end
+local function workerPriorityTokens()
+    -- Do not spend the last tokens needed for near-term permanent perks.
+    local hold = math.max(0, tonumber(opts.WorkerTokenReserve) or 30)
+    if not opts.AutoPerks then return hold end
+    for _, key in ipairs({'Value','Rate','Bargain','Cash','Tokens','CatchUp'}) do
+        local perk = Config.PerkByKey and Config.PerkByKey[key]
+        if perk and LocalPlayer:GetAttribute('Perk_' .. key) ~= true then
+            hold = math.max(hold, math.min(125, tonumber(perk.Cost) or 0))
+            break
+        end
+    end
+    return hold
+end
+local function chooseWorkerCase(data)
+    if opts.WorkerCaseType ~= 'Smart' then return Workers.CaseByKey[opts.WorkerCaseType] end
+    local owned = data.I or {}
+    local count, rare, top = 0, 0, 0
+    for id, row in pairs(owned) do
+        if Workers.ById[id] and type(row) == 'table' then
+            count = count + 1
+            local rank = Workers.RankOf(Workers.ById[id].Rarity)
+            if rank >= 3 then rare = rare + 1 end
+            if rank >= 5 then top = top + 1 end
+        end
+    end
+    if count < 2 then return Workers.CaseByKey.Intern end
+    if rare < 2 then return Workers.CaseByKey.Office end
+    if top < 2 then return Workers.CaseByKey.Executive end
+    return Workers.CaseByKey.Tycoon
+end
+local function workerTick()
+    if not opts.AutoWorkers or nattr('Rebirths') < Workers.Unlock or
+        not ready('worker-plan', 3) then return end
+    local data = state.workers
+    if type(data) ~= 'table' or type(data.I) ~= 'table' or type(data.E) ~= 'table' then
+        state.workersStatus = 'Checking Hiring Agency inventory'
+        return
+    end
+    if state.workersDirty or now() - state.workersSnapshotAt > 40 then
+        state.workersStatus = 'Refreshing workers before spending tokens'
+        return
+    end
+    local tokens = nattr('Tokens')
+    local reserve = workerPriorityTokens()
+    local owned = data.I
+    local scored = {}
+    for id, row in pairs(owned) do
+        local item = Workers.ById[id]
+        if item and type(row) == 'table' then
+            scored[#scored+1] = {id=id, item=item, row=row, score=workerScore(item,row)}
+        end
+    end
+    table.sort(scored, function(a,b)
+        return a.score > b.score or (a.score == b.score and a.id < b.id)
+    end)
+    -- Always equip the two/three strongest distinct owned workers, in place.
+    local cap = Workers.SlotsOf(data)
+    for slot=1, math.min(cap,#scored) do
+        local id = scored[slot].id
+        if data.E['S' .. slot] ~= id and ready('worker-equip-' .. slot, 7) then
+            local res = rpc('EquipWorker', id, slot)
+            if res.ok then
+                state.workersDirty = true
+                state.workerEquips = state.workerEquips + 1
+                state.workersStatus = 'Assigned ' .. scored[slot].item.Name
+            else state.throttles['worker-equip-' .. slot] = now() + 18 end
+            return
+        end
+    end
+    -- Level the strongest active worker before gambling more tokens, but
+    -- prefer hiring when an equipment slot is still empty.
+    local missing = #scored < cap
+    if opts.AutoUpgradeWorkers and not missing then
+        local choice, advantage = nil, -math.huge
+        for slot=1, cap do
+            local id = data.E['S' .. slot]
+            local row = id and owned[id]
+            local item = id and Workers.ById[id]
+            if item and type(row) == 'table' then
+                local level = tonumber(row.L) or 1
+                local cost = Workers.UpgradeCost(item, level)
+                if cost and cost > 0 and tokens >= cost + reserve then
+                    local improvement = workerScore(item,{L=level+1}) - workerScore(item,row)
+                    local gain = improvement / math.sqrt(cost)
+                    if gain > advantage then advantage, choice = gain, id end
+                end
+            end
+        end
+        if choice and ready('worker-upgrade', 12) then
+            local res = rpc('UpgradeWorker', choice)
+            if res.ok then
+                state.workerUpgrades = state.workerUpgrades + 1
+                state.workersDirty = true
+                state.workersStatus = 'Promoted ' .. (Workers.ById[choice].Name or choice)
+            else state.throttles['worker-upgrade'] = now() + 30 end
+            return
+        end
+    end
+    if not opts.AutoHireWorkers or not ready('worker-hire', 20) then return end
+    local case = chooseWorkerCase(data)
+    if not case or not case.Cost then return end
+    if tokens < case.Cost + reserve then
+        state.workersStatus = string.format('Saving tokens %s/%s for %s',
+            fmt(tokens),fmt(case.Cost+reserve),case.Name)
+        return
+    end
+    local res = rpc('HireWorker',case.Key)
+    if res.ok then
+        state.workerCases = state.workerCases + 1
+        state.workersDirty = true
+        state.workersStatus = 'Hired: ' .. tostring(res.Id or case.Name)
+        say(state.workersStatus)
+    else
+        state.workerFailures = math.min(6,state.workerFailures+1)
+        state.throttles['worker-hire'] = now() + math.min(180,12*2^(state.workerFailures-1))
+        state.workersStatus = 'Hiring attempt rejected; backing off'
+    end
+end
+local function runWorkerRefresh()
+    local last = 0
+    while state.alive do
+        if opts.AutoWorkers and nattr('Rebirths') >= Workers.Unlock then
+            local age = now() - last
+            if (state.workersDirty and age > 3) or
+                (now() - state.workersSnapshotAt > 35 and age > 8) then
+                last = now()
+                local result = rpc('Workers')
+                if result.ok then
+                    state.workers = {
+                        I=result.I or {}, E=result.E or {}, P=result.P or {},
+                        N=result.N or 0, Extra=result.Extra or 0,
+                    }
+                    state.workersDirty = false
+                    state.workersSnapshotAt = now()
+                end
+            end
+        end
+        task.wait(1.4)
     end
 end
 
@@ -1095,11 +1475,19 @@ if Net and Net:IsA('RemoteEvent') then
             state.gear = data
             state.gearSnapshotAt = now()
             state.gearDirty = false
+        elseif event == 'WorkerData' and type(data) == 'table' then
+            state.workers = data
+            state.workersDirty = false
+            state.workersSnapshotAt = now()
+        elseif event == 'WorkersUnlocked' then
+            state.workersDirty = true
         elseif event == 'CrateGone' and type(data) == 'table' and data.Got then
             state.counters.crates = state.counters.crates + 1
             state.worldAcks.crate = now()
             state.worldAttempts.crate = now() + 10
         elseif event == 'PailGone' and type(data) == 'table' and data.Got then
+            state.eventPails = state.eventPails + 1
+            state.eventPailLastAt = now()
             state.worldAcks.pail = now()
             state.worldAttempts.pail = now() + 10
         elseif event == 'Obby' then
@@ -1165,6 +1553,7 @@ toggle(farmTab, 'Auto Buy Upgrade Pads', 'AutoBuyPads')
 dropdown(farmTab, 'Farming Focus', 'ActivityPriority',
     {'Balanced','Extras First','Upgrades First','Extras Only'})
 toggle(farmTab, 'Automatic Rebirths', 'AutoRebirth')
+toggle(farmTab, 'Explore New Sky Floors Before Rebirth', 'AutoBuildFloor3')
 toggle(farmTab, 'Buy Permanent Perks', 'AutoPerks')
 dropdown(farmTab, 'Upgrade Priority', 'BuyMode', {'Balanced','Cheapest','Highest Value'})
 dropdown(farmTab, 'Rebirth Strategy', 'RebirthMode', {'Smart','Fast','Balanced','Extra Tokens'})
@@ -1183,17 +1572,28 @@ toggle(extrasTab, 'Collect Mystery Crates', 'AutoCrates')
 toggle(extrasTab, 'Collect Halloween Candy Pails', 'AutoPails')
 toggle(extrasTab, 'Hunt Lost Gears', 'AutoLostGears')
 toggle(extrasTab, 'Auto Obby Reward (Teleport)', 'AutoObby')
-extrasTab:CreateSection('Halloween Event')
-toggle(extrasTab, 'Buy Unowned Event Gear', 'AutoHalloweenGear')
-toggle(extrasTab, 'Brew With Extra Candy', 'AutoBrew')
-slider(extrasTab, 'Keep Candy Reserve', 'CandyReserve', 0, 500, 25)
+extrasTab:CreateSection("Halloween · Witch's Hut")
+toggle(extrasTab, 'Auto Complete Halloween Event', 'AutoHalloweenEvent')
+dropdown(extrasTab, 'Halloween Goal', 'HalloweenGoal',
+    {'Set then Brew','Brew First','Set Only','Brew Only'})
+toggle(extrasTab, 'Wear Reaper Set for +40% Candy', 'WearReaperSet')
+toggle(extrasTab, 'Stop When Both Rare + Crown Are Owned', 'StopBrewAfterCrown')
+slider(extrasTab, 'Keep Candy Reserve for Brews', 'CandyReserve', 0, 500, 25)
+local eventLabel = extrasTab:CreateLabel('Halloween: waiting for candy and gear')
+extrasTab:CreateSection('UPD 4 · Hiring Agency')
+toggle(extrasTab, 'Auto Workers (50 Rebirths)', 'AutoWorkers')
+toggle(extrasTab, 'Hire Worker Briefcases', 'AutoHireWorkers')
+toggle(extrasTab, 'Upgrade Owned Workers', 'AutoUpgradeWorkers')
+dropdown(extrasTab, 'Worker Briefcase Strategy', 'WorkerCaseType', {'Smart','Intern','Office','Executive','Tycoon'})
+local workerLabel = extrasTab:CreateLabel('Workers: unlock at 50 rebirths')
 extrasTab:CreateSection('Blacksmith + Equipment')
 toggle(extrasTab, 'Equip Best Owned Gear', 'AutoEquipGear')
 toggle(extrasTab, 'Upgrade Best Gear', 'AutoImproveGear')
 toggle(extrasTab, 'Fuse Max-Level Gear (Optional)', 'AutoFuseGear')
 toggle(extrasTab, 'Smart Auto Toolboxes (No Robux)', 'AutoCases')
 toggle(extrasTab, 'Salvage Excess Copies (Optional)', 'AutoSalvage')
-dropdown(extrasTab, 'Toolbox Strategy', 'CaseType', {'Smart','Scrap','Forge'})
+dropdown(extrasTab, 'Toolbox Strategy', 'CaseType', {'Smart','Scrap','Forge','Grinder'})
+toggle(extrasTab, 'Use Lucky Gear For Toolboxes', 'AutoCaseLuck')
 slider(extrasTab, 'Keep Scrap Reserve for Cases', 'CaseReserve', 0, 500, 5)
 local caseLabel = extrasTab:CreateLabel('Toolboxes: waiting for inventory')
 local obbyLabel = extrasTab:CreateLabel('Obby: waiting for reward status')
@@ -1208,6 +1608,7 @@ toggle(settingsTab, 'Touch Interest Fallback', 'UseTouchInterest')
 slider(settingsTab, 'Cash Reserve Percent', 'ReservePercent', 0, 75, 5)
 slider(settingsTab, 'Maximum Collectible Detour', 'MaxCollectibleDetour', 80, 1800, 20)
 slider(settingsTab, 'Extras Check Interval (Seconds)', 'ExtrasInterval', 8, 30, 1)
+slider(settingsTab, 'Reserve Rebirth Tokens For Perks', 'WorkerTokenReserve', 0, 500, 10)
 settingsTab:CreateSection('Management')
 settingsTab:CreateLabel('Configs tab supports autosave, autoload, profiles and JSON export/import.')
 settingsTab:CreateLabel('No gamepasses or Robux purchase prompts are used.')
@@ -1239,6 +1640,10 @@ win:SetCloseCallback(unload)
 -- This prevents repeated Saving / Waiting status loops from starving other tasks.
 local function extrasWorkTick()
     if not state.alive or not canGo() then return false end
+    -- Halloween pails are spawned client-side and disappear in ~100s.
+    -- Always take an available pail before long Obby/gear detours.
+    if opts.AutoPails and eventOn() and
+        worldTick(false, opts.MaxCollectibleDetour, false, true) then return true end
     -- Guarantee gear rounds; Obby cannot repeatedly preempt them. Spare
     -- cycles still collect crates, pails and the available Obby reward.
     if opts.AutoLostGears and now() - state.lastGearAttempt >= 10 and
@@ -1321,7 +1726,7 @@ local function runFarm()
             if opts.AutoRebirth then
                 local cost = nattr('RebirthCost')
                 local cash = nattr('Cash')
-                if cost > 0 and cash >= cost then
+                if cost > 0 and cash >= cost and not floor3Focus() then
                     local multiple = opts.RebirthMode == 'Extra Tokens' and 4 or
                         opts.RebirthMode == 'Balanced' and 2 or 1
                     -- If we have enough for the base rebirth but want more tokens,
@@ -1384,8 +1789,9 @@ local function runFastRewards()
         task.wait(0.85)
     end
 end
+
 local function runMaintenance()
-    local loops = {buyPerk, questTick, codesTick, autoGear, caseTick, halloweenTick, salvageTick}
+    local loops = {buyPerk, workerTick, questTick, codesTick, autoGear, caseTick, halloweenTick, salvageTick}
     local index = 0
     while state.alive do
         index = index % #loops + 1
@@ -1401,7 +1807,7 @@ end
 local function runGearRefresh()
     local lastRequest = 0
     while state.alive do
-        if opts.AutoEquipGear or opts.AutoImproveGear or opts.AutoFuseGear or opts.AutoCases or opts.AutoLostGears or opts.AutoHalloweenGear or opts.AutoSalvage then
+        if opts.AutoEquipGear or opts.AutoImproveGear or opts.AutoFuseGear or opts.AutoCases or opts.AutoLostGears or opts.AutoHalloweenEvent or opts.AutoSalvage then
             local elapsed = now() - lastRequest
             local stale = not state.gear or now() - state.gearSnapshotAt > 25
             if (state.gearDirty and elapsed >= 2.5) or (stale and elapsed >= 5) then
@@ -1426,7 +1832,12 @@ local function runStatus()
                 walletLabel:Set(string.format('Cash $%s  |  Income $%s/s  |  Tokens %s',
                     fmt(nattr('Cash')), fmt(nattr('Income')), fmt(nattr('Tokens'))))
             end
+            if eventLabel then eventLabel:Set('Halloween: ' .. tostring(state.eventStatus) ..
+                ' | Candy ' .. fmt(nattr('Candy')) .. ' | Brews ' .. tostring(state.eventBrews) ..
+                ' | Pails ' .. tostring(state.eventPails)) end
             if obbyLabel then obbyLabel:Set('Obby: ' .. tostring(state.obbyStatus)) end
+            if workerLabel then workerLabel:Set('Workers: ' .. (nattr('Rebirths') < Workers.Unlock and
+                ('Unlock at '..Workers.Unlock..' rebirths') or state.workersStatus)) end
             if caseLabel then
                 caseLabel:Set(string.format('Scrap %s  |  Cases %d  |  %s',
                     fmt(nattr('Scrap')), state.counters.cases, state.caseDecision or 'Idle'))
@@ -1443,5 +1854,6 @@ task.spawn(runFarm)
 task.spawn(runFastRewards)
 task.spawn(runMaintenance)
 task.spawn(runGearRefresh)
+task.spawn(runWorkerRefresh)
 task.spawn(runStatus)
-notify('v1.6 loaded | adaptive rebirth + fair gear scheduler + no wasted extras windows')
+notify("v1.9 UPD 4 | polished Halloween + protected Reaper restoration + smarter cases")

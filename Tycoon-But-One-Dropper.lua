@@ -36,13 +36,15 @@ local state = {
     extrasUntil = 0, nextExtrasAt = 0, extrasCycles = 0,
     obbyNextTryAt = 0, obbyFailures = 0, obbyLastReward = 0,
     obbyStatus = 'Not attempted', obbyAckAt = 0, wheelFailures = 0,
+    lastGearAttempt = 0, lastWorldActivity = 0, nextIdleCollectAt = 0,
+    lastPrioritySwitchAt = 0, idleSince = 0, fallbackCount = 0,
     status = 'Initialising', lastError = '',
 }
 Env.PuckTBOD31 = state
 
 local opts = {
     AutoFarm = true, AutoBuyPads = true, ActivityPriority = 'Balanced',
-    ExtrasInterval = 22, AutoObby = true,
+    ExtrasInterval = 15, AutoObby = true,
     AutoRebirth = true, AutoPerks = true,
     AutoRewards = true, AutoQuests = true, AutoCodes = true, AutoGroupReward = true,
     AutoLostGears = true, AutoCrates = true, AutoPails = true,
@@ -91,7 +93,7 @@ end
 local function rpc(key, ...)
     if not state.alive then return {ok = false, msg = 'Unloaded'} end
     local args = table.pack(...)
-    local waitUntil = now() + 7
+    local waitUntil = now() + 1.4
     while state.alive and state.rpcBusy and now() < waitUntil do task.wait(0.035) end
     if not state.alive then return {ok = false, msg = 'Unloaded'} end
     if state.rpcBusy then return {ok = false, msg = 'Action busy'} end
@@ -99,10 +101,23 @@ local function rpc(key, ...)
     local waitFor = math.max(0, state.nextRpc - now())
     if waitFor > 0 then task.wait(math.min(waitFor, 1.25)) end
     if not state.alive then state.rpcBusy = false return {ok = false, msg = 'Unloaded'} end
-    local worked, result = pcall(function()
-        return Action:InvokeServer(key, table.unpack(args, 1, args.n))
+    -- InvokeServer has no cancellation API. Run its request in a separate
+    -- task so a stalled server reply cannot freeze the farm worker forever.
+    -- Keep the action lock until that request *actually* finishes.
+    local finished, worked, result = false, false, nil
+    task.spawn(function()
+        worked, result = pcall(function()
+            return Action:InvokeServer(key, table.unpack(args, 1, args.n))
+        end)
+        finished = true
+        state.rpcBusy = false
     end)
-    state.rpcBusy = false
+    local deadline = now() + 4.0
+    while state.alive and not finished and now() < deadline do task.wait(0.045) end
+    if not finished then
+        state.lastError = 'Slow server response: ' .. tostring(key)
+        return {ok = false, msg = 'Timed out waiting for ' .. tostring(key)}
+    end
     if not worked then
         state.lastError = tostring(result)
         state.nextRpc = now() + 0.8
@@ -500,7 +515,12 @@ local function lostGearTarget()
     for _, model in ipairs(folder:GetChildren()) do
         local index = tonumber(model.Name:match('^LostGear(%d+)$'))
         local spot = model:GetAttribute('Spot')
-        if index and typeof(spot) == 'Vector3' and (state.worldAttempts['gear:' .. index] or 0) <= now() then
+        local lost = state.gear and state.gear.Lost
+        -- Skip rewards already completed in the current collection round.
+        local alreadyOwned = index and type(lost) == 'table' and
+            (lost['g' .. index] == true or lost[index] == true or lost[tostring(index)] == true)
+        if index and not alreadyOwned and typeof(spot) == 'Vector3'
+            and (state.worldAttempts['gear:' .. index] or 0) <= now() then
             local dist = (root.Position - spot).Magnitude
             if dist < bestDist then
                 bestDist, nearest = dist, {kind = 'gear', key = 'gear:' .. index, index = index, pos = spot, obj = model}
@@ -539,11 +559,19 @@ local function worldTarget(allowGear, maxDetour)
         local candidate = lostGearTarget()
         if candidate then targets[#targets + 1] = candidate end
     end
-    local best, closest = nil, math.huge
+    local best, closest, gearChoice, gearDist = nil, math.huge, nil, math.huge
     for _, target in ipairs(targets) do
         local dist = (root.Position - target.pos).Magnitude
-        if dist <= maxDetour and dist < closest then best, closest = target, dist end
+        if dist <= maxDetour then
+            if dist < closest then best, closest = target, dist end
+            if target.kind == 'gear' and dist < gearDist then
+                gearChoice, gearDist = target, dist
+            end
+        end
     end
+    -- A continuous supply of crates can otherwise prevent lost-gear rounds.
+    -- Give gears an explicit service slot every 12 seconds when available.
+    if gearChoice and now() - state.lastGearAttempt >= 12 then return gearChoice end
     return best
 end
 
@@ -551,37 +579,51 @@ local function worldTick(allowGear, maxDetour)
     if not state.alive or not canGo() or now() < state.busyUntil then return false end
     local target = worldTarget(allowGear, maxDetour)
     if not target then return false end
-    local delay = target.kind == 'gear' and 5 or 3
+    if target.kind == 'gear' then state.lastGearAttempt = now() end
+    local delay = target.kind == 'gear' and 4 or 3
     state.worldAttempts[target.key] = now() + delay
     say('Collecting ' .. (target.kind == 'crate' and 'mystery crate' or
         target.kind == 'pail' and 'candy pail' or 'lost gear'))
     local ackBefore = state.worldAcks[target.key] or 0
     local moved = moveNear(target.pos, 4.5, 1.1)
-    if not moved then state.worldAttempts[target.key] = now() + 10 return false end
-    local deadline = now() + (target.kind == 'gear' and 1.35 or 1.1)
-    repeat
-        if not state.alive or not target.obj.Parent or
-            (state.worldAcks[target.key] or 0) > ackBefore then break end
-        task.wait(0.10)
-    until now() >= deadline
-    -- Model disappearance by itself is not always collection: the game's UI
-    -- also destroys crates and pails after their timed lifespan expires.
-    local succeeded = (state.worldAcks[target.key] or 0) > ackBefore
+    if not moved then
+        state.worldAttempts[target.key] = now() + 12
+        return true -- an attempted activity consumes its slot; don't immediately fight another worker
+    end
+    local succeeded = false
     if target.kind == 'gear' then
-        local gd = state.gear
-        local collected = gd and type(gd.Lost) == 'table' and gd.Lost['g' .. target.index] == true
-        succeeded = collected or not target.obj.Parent
-    end
-    if succeeded then
-        if target.kind == 'gear' then
-            state.counters.gears = state.counters.gears + 1
-            state.gearDirty = true
+        -- LostGears/LostGearN are local decorations. The game's GearUI actually
+        -- calls Action('LostGear', index) after approaching the Spot.
+        -- Merely teleporting to the model does NOT collect the reward.
+        local _, root = humanoidParts()
+        if root and (root.Position - target.pos).Magnitude <= 9 then
+            local result = rpc('LostGear', target.index)
+            succeeded = result.ok == true
+            if succeeded then
+                state.worldAcks[target.key] = now()
+                state.gearDirty = true
+                state.counters.gears = state.counters.gears + 1
+                -- An accepted gear stays visually visible on some clients.
+                -- Wait for refreshed GearData, or a new collection round.
+                state.worldAttempts[target.key] = now() + 90
+                say('Collected lost gear #' .. tostring(target.index))
+            else
+                state.worldAttempts[target.key] = now() + 18
+            end
         end
-        state.worldAttempts[target.key] = now() + 2.0
     else
-        state.worldAttempts[target.key] = now() + (target.kind == 'gear' and 13 or 8)
+        -- Crates/pails are proximity-based; only the server Got flag counts.
+        local deadline = now() + 1.1
+        repeat
+            if not state.alive or (state.worldAcks[target.key] or 0) > ackBefore
+                or not target.obj.Parent then break end
+            task.wait(0.10)
+        until now() >= deadline
+        succeeded = (state.worldAcks[target.key] or 0) > ackBefore
+        state.worldAttempts[target.key] = now() + (succeeded and 5 or 9)
     end
-    return succeeded
+    state.lastWorldActivity = now()
+    return true -- an attempted collectible trip is useful work, including failed/denied trips
 end
 
 -- Obby markers were confirmed in the uploaded RBXL as AttributesSerialize
@@ -966,6 +1008,18 @@ if Net and Net:IsA('RemoteEvent') then
     table.insert(state.connections, Net.OnClientEvent:Connect(function(event, data)
         if not state.alive then return end
         if event == 'GearData' and type(data) == 'table' then
+            local oldLost = state.gear and state.gear.Lost
+            local newLost = data.Lost
+            if type(oldLost) == 'table' and type(newLost) == 'table' then
+                local oldCount, newCount = 0, 0
+                for _, v in pairs(oldLost) do if v == true then oldCount = oldCount + 1 end end
+                for _, v in pairs(newLost) do if v == true then newCount = newCount + 1 end end
+                if newCount < oldCount then
+                    for key in pairs(state.worldAttempts) do
+                        if string.sub(key, 1, 5) == 'gear:' then state.worldAttempts[key] = nil end
+                    end
+                end
+            end
             state.gear = data
             state.gearSnapshotAt = now()
             state.gearDirty = false
@@ -1081,7 +1135,7 @@ slider(settingsTab, 'Purchase Check Delay (x100)', 'PadDelay', 12, 100, 4)
 toggle(settingsTab, 'Touch Interest Fallback', 'UseTouchInterest')
 slider(settingsTab, 'Cash Reserve Percent', 'ReservePercent', 0, 75, 5)
 slider(settingsTab, 'Maximum Collectible Detour', 'MaxCollectibleDetour', 80, 1800, 20)
-slider(settingsTab, 'Extras Check Interval (Seconds)', 'ExtrasInterval', 10, 120, 2)
+slider(settingsTab, 'Extras Check Interval (Seconds)', 'ExtrasInterval', 8, 30, 1)
 settingsTab:CreateSection('Management')
 settingsTab:CreateLabel('Configs tab supports autosave, autoload, profiles and JSON export/import.')
 settingsTab:CreateLabel('No gamepasses or Robux purchase prompts are used.')
@@ -1106,11 +1160,14 @@ win:SetCloseCallback(unload)
 -- the boolean/numeric/dropdown options above and deliberately never uploads config.
 -- PuckUI automatically generates its complete Configs tab.
 
--- Guaranteed activity windows prevent continuous affordable pad purchasing
--- from starving Obby, Lost Gears and crate/pail collection indefinitely.
--- Maintenance (wheel, quests, gear, toolboxes) continues in its own worker.
+-- Opportunistic scheduler:
+--   (1) Scheduled extras windows have a maximum gap, even when pads are affordable.
+--   (2) Any economic/plot/build/rebirth wait immediately yields to collectibles.
+--   (3) Maintenance independently collects spins, quests, perks, Blacksmith rewards.
+-- This prevents repeated Saving / Waiting status loops from starving other tasks.
 local function extrasWorkTick()
     if not state.alive or not canGo() then return false end
+    -- Respect the actual ObbyNext cooldown and retry backoff.
     if opts.AutoObby and obbyTick() then return true end
     if worldTick(true, opts.MaxCollectibleDetour) then return true end
     return false
@@ -1119,10 +1176,12 @@ end
 local function extrasActive()
     local mode = opts.ActivityPriority
     if not opts.AutoBuyPads or mode == 'Extras Only' then return true end
-    local interval = math.clamp(tonumber(opts.ExtrasInterval) or 22, 10, 120)
-    if state.nextExtrasAt == 0 then state.nextExtrasAt = now() + math.min(8, interval * 0.5) end
+    local interval = math.clamp(tonumber(opts.ExtrasInterval) or 15, 8, 30)
+    if state.nextExtrasAt == 0 then
+        state.nextExtrasAt = now() + math.min(5, interval * 0.35)
+    end
     if now() >= state.nextExtrasAt and now() >= state.extrasUntil then
-        local window = mode == 'Extras First' and 13 or mode == 'Upgrades First' and 4 or 8
+        local window = mode == 'Extras First' and 14 or mode == 'Upgrades First' and 5 or 10
         state.extrasUntil = now() + window
         state.nextExtrasAt = state.extrasUntil + interval
         state.extrasCycles = state.extrasCycles + 1
@@ -1130,50 +1189,62 @@ local function extrasActive()
     return now() < state.extrasUntil
 end
 
+local function idleToExtras(reason)
+    -- A failed/locked/pending upgrade is not a reason to stand still when
+    -- reward spots, crates, or gears may be waiting elsewhere.
+    if now() >= state.nextIdleCollectAt then
+        state.nextIdleCollectAt = now() + 0.55
+        if extrasWorkTick() then
+            state.fallbackCount = state.fallbackCount + 1
+            return true
+        end
+    end
+    say(reason .. ' | rewards and gears checked')
+    task.wait(0.18)
+    return false
+end
+
 local function runFarm()
     while state.alive do
         local ok, err = pcall(function()
             if not opts.AutoFarm then
                 say('Autofarm paused')
-                task.wait(0.45)
+                task.wait(0.35)
                 return
             end
             if not canGo() then
-                say('Waiting for character respawn')
-                task.wait(0.6)
+                say('Recovering character')
+                task.wait(0.3)
                 return
             end
-            if state.busyUntil > now() then task.wait(0.08); return end
-            local focus = extrasActive()
-            if focus then
-                if rebirthTick() then return end
-                if extrasWorkTick() then return end
-                if not opts.AutoBuyPads or opts.ActivityPriority == 'Extras Only' then
-                    say('Extras only: upgrades disabled; watching rewards + collectibles')
-                else
-                    say('Extras window: checking rewards + collectibles')
+            if state.busyUntil > now() then task.wait(0.06); return end
+            if rebirthTick() then return end
+            if extrasActive() then
+                if not extrasWorkTick() then
+                    -- Already checked extras this frame: don't scan twice.
+                    state.nextIdleCollectAt = now() + 0.55
+                    local label = (not opts.AutoBuyPads or opts.ActivityPriority == 'Extras Only')
+                        and 'Extras only' or 'Extras priority window'
+                    idleToExtras(label)
                 end
-                task.wait(0.35)
                 return
             end
             local plot = findPlot()
             if not plot then
-                say('Waiting for owned plot')
-                task.wait(1.2)
+                idleToExtras('Waiting for your plot')
                 return
             end
-            if rebirthTick() then return end
-            -- Grab nearby temporary pickups while heading towards the next pad.
+            -- Nearby pickups can interrupt travel without losing scheduled gear rounds.
             if worldTick(false, 60) then return end
             if opts.AutoRebirth then
-                local rebirthCost = nattr('RebirthCost')
-                local currentCash = nattr('Cash')
-                if rebirthCost > 0 and currentCash >= rebirthCost then
+                local cost = nattr('RebirthCost')
+                local cash = nattr('Cash')
+                if cost > 0 and cash >= cost then
                     local multiple = opts.RebirthMode == 'Extra Tokens' and 4 or
                         opts.RebirthMode == 'Balanced' and 2 or 1
-                    say('Saving for rebirth: $' .. fmt(currentCash) .. ' / $' ..
-                        fmt(rebirthCost * multiple) .. ' (' .. opts.RebirthMode .. ')')
-                    task.wait(0.32)
+                    -- If we have enough for the base rebirth but want more tokens,
+                    -- upgrade buying must pause, NOT the whole autofarm.
+                    idleToExtras('Saving for rebirth: $' .. fmt(cash) .. '/$' .. fmt(cost * multiple))
                     return
                 end
             end
@@ -1185,38 +1256,54 @@ local function runFarm()
                 table.clear(state.padFailures)
                 table.clear(state.failures)
             end
-            if candidate and ready('pad-cycle', 0.10) then
-                buyPad(plot, candidate)
-                task.wait(0.05)
-            else
-                local buildRemaining = state.nextConstruction and state.nextConstruction - workspace:GetServerTimeNow() or 0
-                if buildRemaining > 0 and buildRemaining < 8 then
-                    say('Building next upgrade (' .. math.ceil(buildRemaining) .. 's)')
-                    task.wait(0.28)
+            if candidate then
+                -- Pad cooldown is only 0.1s. Don't leave for a distant gear
+                -- between two normal consecutive successful purchases.
+                if not ready('pad-cycle', 0.10) then
+                    task.wait(0.06)
                     return
                 end
-                if worldTick(true, opts.MaxCollectibleDetour) then return end
-                if count == 0 then
-                    say(buildRemaining > 0 and ('Waiting for build: ' .. math.ceil(buildRemaining) .. 's') or
-                        'All current upgrade pads complete; awaiting rebirth')
-                elseif nextPrice < math.huge then
-                    say('Saving cash: $' .. fmt(cash) .. ' / $' .. fmt(nextPrice))
-                else
-                    say('Waiting for upgrades')
+                if not buyPad(plot, candidate) then
+                    idleToExtras('Upgrade waiting for confirmation')
                 end
-                task.wait(0.36)
+                task.wait(0.04)
+                return
+            end
+            local buildRemaining = state.nextConstruction and state.nextConstruction - workspace:GetServerTimeNow() or 0
+            if buildRemaining > 0 and buildRemaining < 8 then
+                idleToExtras('Building next upgrade (' .. math.ceil(buildRemaining) .. 's)')
+            elseif count == 0 then
+                idleToExtras(buildRemaining > 0 and
+                    ('Waiting for construction (' .. math.ceil(buildRemaining) .. 's)') or
+                    'No available upgrades; checking extras')
+            elseif nextPrice < math.huge then
+                idleToExtras('Saving: $' .. fmt(cash) .. '/$' .. fmt(nextPrice))
+            else
+                idleToExtras('Waiting for upgrades')
             end
         end)
         if not ok then
             state.lastError = tostring(err)
             warn('[PuckAFK TBOD][Farm] ' .. tostring(err))
-            task.wait(0.6)
+            task.wait(0.4)
         end
-        task.wait(0.08)
+        task.wait(0.06)
+    end
+end
+-- Keep wheel spins/daily reward checks independent from slow inventory scans.
+-- Gear loadout optimisation must never delay the next free wheel spin.
+local function runFastRewards()
+    while state.alive do
+        local ok, err = pcall(rewardsTick)
+        if not ok then
+            state.lastError = tostring(err)
+            warn('[PuckAFK TBOD][Fast Rewards] ' .. tostring(err))
+        end
+        task.wait(0.85)
     end
 end
 local function runMaintenance()
-    local loops = {buyPerk, rewardsTick, questTick, codesTick, autoGear, caseTick, halloweenTick, salvageTick}
+    local loops = {buyPerk, questTick, codesTick, autoGear, caseTick, halloweenTick, salvageTick}
     local index = 0
     while state.alive do
         index = index % #loops + 1
@@ -1271,7 +1358,8 @@ end
 -- PuckUI loads the selected profile after controls are registered.
 
 task.spawn(runFarm)
+task.spawn(runFastRewards)
 task.spawn(runMaintenance)
 task.spawn(runGearRefresh)
 task.spawn(runStatus)
-notify('v1.4 loaded | auto Obby + free spins + priority extras + pad purchase toggle')
+notify('v1.5 loaded | non-idling priority scheduler + actual LostGear claims + extras fallback')

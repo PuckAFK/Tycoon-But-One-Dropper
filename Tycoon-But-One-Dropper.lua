@@ -1,5 +1,5 @@
 --[[
-    PuckAFK | Tycoon, but one dropper!  [UPD 4 | v1.9.1 - Core Reliability Hotfix]
+    PuckAFK | Tycoon, but one dropper!  [UPD 4 | v1.9.2 - Event Automation Fix]
     Based on a static inspection of place 109949693269081, the shared Config/Gear
     modules, client controllers, and a client remote trace dated 2026-10-14.
 
@@ -63,6 +63,10 @@ local state = {
     eventLastBrewAt = 0, eventPailLastAt = 0,
     eventLuckSwaps = 0, eventRestores = 0, eventRestoreFailures = 0,
     eventLastGearSnapshot = 0, eventNextRestore = 0,
+    eventCandyEarned = 0, eventLastCandy = nil, eventSmartNextEarned = 0,
+    eventSmartBrews = 0, eventActionFailures = 0, eventLastAction = 'None',
+    eventLastReason = '', eventBrewCooldown = 0,
+
     currentTask = 'Idle', lastTaskSwitch = 0, startupAt = 0,
     movementFailures = 0, characterChangedAt = 0,
     failedActions = {}, rebirthBlockedUntil = 0,
@@ -80,8 +84,8 @@ local opts = {
     AutoLostGears = true, AutoCrates = true, AutoPails = true,
     -- The old AutoHalloweenGear/AutoBrew values are retained for JSON profile
     -- compatibility; AutoHalloweenEvent and HalloweenGoal are the new controls.
-    AutoHalloweenGear = true, AutoBrew = false, CandyReserve = 100,
-    AutoHalloweenEvent = true, HalloweenGoal = 'Set then Brew',
+    AutoHalloweenGear = true, AutoBrew = false, CandyReserve = 25,
+    AutoHalloweenEvent = true, HalloweenGoal = 'Smart Event',
     WearReaperSet = true, StopBrewAfterCrown = true,
 
     AutoEquipGear = true, AutoImproveGear = true, AutoFuseGear = true,
@@ -875,111 +879,193 @@ local function eventNeedsBrew(snapshot)
         snapshot.I[limited] and snapshot.I[rare] then return false end
     return true
 end
+-- Keep candy earnings independent from outgoings, otherwise recurrent brews
+-- can prevent the player from ever purchasing the permanent Reaper gear.
+local function trackCandy(candy)
+    candy = tonumber(candy) or 0
+    if state.eventLastCandy == nil then
+        state.eventLastCandy = candy
+        state.eventCandyEarned = candy
+    else
+        if candy > state.eventLastCandy then
+            state.eventCandyEarned = state.eventCandyEarned + (candy - state.eventLastCandy)
+        end
+        state.eventLastCandy = candy
+    end
+end
+
+local function eventBrew(inv, candy, mode, reserve)
+    local cost = tonumber(Halloween.Brew and Halloween.Brew.Cost) or 75
+    if candy < cost + reserve then
+        state.eventStatus = ('Cauldron saving: %s/%s candy (%s reserve)')
+            :format(fmt(candy), fmt(cost + reserve), fmt(reserve))
+        return false
+    end
+    if not ready('witch-brew', 5) then
+        state.eventStatus = 'Cauldron ready; waiting for action cooldown'
+        return false
+    end
+    local oldCandy, oldPity = candy, nattr('BrewPity')
+    local result = rpc('HalloweenBrew')
+    if result.ok then
+        local rewardKey = tostring(result.Key or result.key or 'Reward')
+        state.eventBrewResults[rewardKey] = (state.eventBrewResults[rewardKey] or 0) + 1
+        state.eventBrews = state.eventBrews + 1
+        state.eventLastBrewAt = now()
+        state.eventActionFailures = 0
+        state.eventLastAction = 'Brew: ' .. rewardKey
+        state.eventNextTryAt = now() + 2.5
+        -- New inventory snapshots are needed after prize-gear drops.
+        if rewardKey == 'Rare' or rewardKey == 'Limited' then state.gearDirty = true end
+        if mode == 'Smart Event' then
+            -- Only use about one fourth of newly earned candy for optional
+            -- brews while saving for the permanent four-piece Reaper set.
+            state.eventSmartNextEarned = state.eventCandyEarned + cost * 3
+            state.eventSmartBrews = state.eventSmartBrews + 1
+        end
+        state.eventStatus = ('Brew #%d succeeded: %s'):format(state.eventBrews, rewardKey)
+        say("Witch's Hut: " .. state.eventStatus)
+        return true
+    end
+    -- The game returns an explicit server message. Show it rather than
+    -- silently retrying the same rejected request forever.
+    state.eventActionFailures = math.min(6, state.eventActionFailures + 1)
+    state.eventNextTryAt = now() + math.min(90, 4 * 2 ^ (state.eventActionFailures - 1))
+    state.eventStatus = ('Brew rejected: %s'):format(tostring(result.msg or 'server did not accept the action'))
+    state.lastError = 'HalloweenBrew: ' .. tostring(result.msg or 'rejected')
+    return false
+end
+
 local function halloweenTick()
-    if not opts.AutoHalloweenEvent or not state.alive then return end
+    if not state.alive then return end
+    if not opts.AutoHalloweenEvent then
+        state.eventStatus = 'Halloween automation OFF (Extras tab)'
+        return
+    end
     if not eventOn() then
-        state.eventStatus = 'Event is currently inactive'
+        state.eventStatus = 'Halloween event is not active in this server'
         return
     end
-    if now() < state.eventNextTryAt or not ready('event-plan', 2.5) then return end
-    local inv = state.gear
-    local goal = opts.HalloweenGoal
     local candy = nattr('Candy')
-    if not inv or type(inv.I) ~= 'table' or type(inv.E) ~= 'table' or
-        state.gearDirty or now() - state.gearSnapshotAt > 24 then
-        state.eventStatus = 'Refreshing Witch gear inventory'
-        return
+    trackCandy(candy)
+    if now() < state.eventNextTryAt or not ready('event-plan', 0.85) then return end
+    local rawGoal = opts.HalloweenGoal
+    -- Migrate old saved v1.8/v1.9 default. Legacy 'Set then Brew' used to
+    -- postpone every brew until 2,600 candy in event gear was spent.
+    local goal = rawGoal == 'Set then Brew' and 'Smart Event' or rawGoal
+    if goal ~= 'Smart Event' and goal ~= 'Brew First' and goal ~= 'Brew Only' and goal ~= 'Set Only' then
+        goal = 'Smart Event'
     end
+    local inv = state.gear
+    local invReady = type(inv) == 'table' and type(inv.I) == 'table' and
+        type(inv.E) == 'table' and not state.gearDirty and
+        now() - state.gearSnapshotAt <= 35
     local missing, nextItem, wantedTotal = 0, nil, 0
-    for _, item in ipairs(Halloween.Shop or {}) do
-        if not inv.I[item.Id] then
-            missing = missing + 1
-            wantedTotal = wantedTotal + (tonumber(item.Cost) or 0)
-            if not nextItem or (tonumber(item.Cost) or math.huge) < nextItem.Cost then
-                nextItem = item
+    if invReady then
+        for _, item in ipairs(Halloween.Shop or {}) do
+            if not inv.I[item.Id] then
+                missing = missing + 1
+                local price = tonumber(item.Cost) or math.huge
+                wantedTotal = wantedTotal + price
+                if not nextItem or price < (tonumber(nextItem.Cost) or math.huge) then
+                    nextItem = item
+                end
             end
         end
     end
-    local shopFirst = goal == 'Set then Brew' or goal == 'Set Only' or
-        (goal == 'Brew First' and not eventNeedsBrew(inv))
-    local buyEventGear = goal ~= 'Brew Only'
-    local doBrew = goal ~= 'Set Only'
-    if buyEventGear and missing > 0 and (shopFirst or candy < (Halloween.Brew.Cost or 75)) then
-        -- Buy only *unowned* event items, in ascending cost order. Never spend
-        -- any candy reserved for an affordable missing Reaper item on brews.
-        if nextItem and candy >= nextItem.Cost then
-            if not ready('witch-buy:' .. nextItem.Id, 5) then return end
-            local reply = rpc('HalloweenBuy', nextItem.Id)
-            if reply.ok then
-                state.eventPurchases = state.eventPurchases + 1
-                state.eventLastBuyAt = now()
-                state.eventFailures = 0
-                state.gearDirty = true
-                state.eventLastGearSnapshot = state.gearSnapshotAt
-                state.eventNextTryAt = now() + 2.7
-                state.eventStatus = 'Purchased ' .. (Gear.ById[nextItem.Id] and Gear.ById[nextItem.Id].Name or nextItem.Id) ..
-                    ' (' .. (4 - missing + 1) .. '/4)'
-                say("Witch's Hut: " .. state.eventStatus)
-            else
-                state.eventFailures = math.min(5, state.eventFailures + 1)
-                state.eventNextTryAt = now() + math.min(90, 6 * 2 ^ (state.eventFailures - 1))
-                state.eventStatus = 'Event purchase rejected; retrying later'
-            end
+    local reserve = math.max(0, tonumber(opts.CandyReserve) or 0)
+    local brewCost = tonumber(Halloween.Brew and Halloween.Brew.Cost) or 75
+    local wantsShop = goal ~= 'Brew Only'
+    local wantsBrew = goal ~= 'Set Only'
+    if not invReady and wantsShop then
+        state.eventStatus = 'Waiting for Witch gear inventory (GearData)'
+        return
+    end
+    local needsBrew = not invReady or eventNeedsBrew(inv)
+    local canBrew = wantsBrew and needsBrew and candy >= brewCost + reserve
+
+    -- Permanent purchases always win when affordable in the smart strategy.
+    if wantsShop and missing > 0 and nextItem and candy >= nextItem.Cost and
+        (goal == 'Smart Event' or goal == 'Set Only' or
+         (goal == 'Brew First' and not canBrew)) then
+        if not ready('witch-buy:' .. nextItem.Id, 4) then return end
+        local reply = rpc('HalloweenBuy', nextItem.Id)
+        if reply.ok then
+            state.eventPurchases = state.eventPurchases + 1
+            state.eventLastBuyAt = now()
+            state.eventActionFailures = 0
+            state.gearDirty = true
+            state.eventNextTryAt = now() + 1.4
+            state.eventStatus = 'Purchased Witch gear: ' ..
+                tostring((Gear.ById[nextItem.Id] and Gear.ById[nextItem.Id].Name) or nextItem.Id)
+            say("Witch's Hut: " .. state.eventStatus)
         else
-            state.eventStatus = ('Saving candy for Reaper (%s/%s next; %s total remaining)')
-                :format(fmt(candy), fmt(nextItem and nextItem.Cost or 0), fmt(wantedTotal))
+            state.eventActionFailures = math.min(6, state.eventActionFailures + 1)
+            state.eventNextTryAt = now() + math.min(75, 4 * 2 ^ (state.eventActionFailures - 1))
+            state.eventStatus = 'Witch shop rejected: ' .. tostring(reply.msg or 'server declined purchase')
+            state.lastError = 'HalloweenBuy: ' .. tostring(reply.msg or 'rejected')
         end
         return
     end
-    if missing == 0 and opts.WearReaperSet and reaperOwned(inv) then
+
+    -- Reaper gives +40% candy and remains equipped between toolbox openings.
+    if invReady and missing == 0 and opts.WearReaperSet and reaperOwned(inv) then
         local equipped = Gear.Total({I = inv.I, E = inv.E})
-        if not (equipped.Sets and equipped.Sets.Reaper) and ready('witch-set', 8) then
+        if not (equipped.Sets and equipped.Sets.Reaper) and ready('witch-set', 9) then
             local result = rpc('GearEquipSet', 'Reaper')
             if result.ok then
                 state.eventSetEquips = state.eventSetEquips + 1
                 state.gearDirty = true
-                state.eventNextTryAt = now() + 2.6
-                state.eventStatus = 'Equipped Reaper: +40% candy'
+                state.eventNextTryAt = now() + 1.5
+                state.eventStatus = 'Equipped full Reaper set for +40% candy'
             else
-                state.throttles['witch-set'] = now() + 25
+                state.throttles['witch-set'] = now() + 20
+                state.eventStatus = 'Reaper equip rejected: ' .. tostring(result.msg or 'server declined')
             end
             return
         end
     end
-    if doBrew and eventNeedsBrew(inv) then
-        local cost = tonumber(Halloween.Brew and Halloween.Brew.Cost) or 75
-        local reserve = math.max(0, tonumber(opts.CandyReserve) or 0)
-        -- In Brew First mode, preserve the explicitly requested reserve only.
-        -- In Set then Brew mode, all shop items must already be owned.
-        if candy < cost + reserve then
-            state.eventStatus = ('Saving for brew (%s/%s candy, pity %s/%s)')
-                :format(fmt(candy), fmt(cost + reserve), fmt(nattr('BrewPity')),
-                    fmt(Halloween.Brew.Pity or 15))
-            return
-        end
-        if not ready('witch-brew', 6) then return end
-        local result = rpc('HalloweenBrew')
-        if result.ok then
-            local rewardKey = tostring(result.Key or 'Unknown')
-            state.eventBrewResults[rewardKey] = (state.eventBrewResults[rewardKey] or 0) + 1
-            state.eventBrews = state.eventBrews + 1
-            state.eventLastBrewAt = now()
-            state.eventFailures = 0
-            state.eventNextTryAt = now() + 3.5
-            if rewardKey == 'Rare' or rewardKey == 'Limited' then state.gearDirty = true end
-            state.eventStatus = ('Brew #%d: %s'):format(state.eventBrews, rewardKey)
-            say("Witch's Hut: " .. state.eventStatus)
+
+    if wantsBrew and not needsBrew then
+        state.eventStatus = 'Both rare brew rewards already owned'
+        return
+    end
+
+    local smartAllowsBrew = true
+    if goal == 'Smart Event' and missing > 0 then
+        -- Avoid spending the final 75 candy immediately before a shop item.
+        local gap = nextItem and (tonumber(nextItem.Cost) - candy) or math.huge
+        local enoughNewCandy = state.eventCandyEarned >= state.eventSmartNextEarned
+        local enoughTime = now() - state.eventLastBrewAt >= 20
+        smartAllowsBrew = gap > brewCost and enoughNewCandy and enoughTime
+    end
+    if canBrew and smartAllowsBrew then
+        eventBrew(inv, candy, goal, reserve)
+        return
+    end
+    if goal == 'Set Only' or (goal == 'Smart Event' and missing > 0) then
+        local target = nextItem and nextItem.Cost or 0
+        local nextBrew = math.max(0, state.eventSmartNextEarned - state.eventCandyEarned)
+        if goal == 'Smart Event' and not canBrew then
+            state.eventStatus = ('Witch: %s/%s candy for brew (reserve %s); Reaper %s/%s')
+                :format(fmt(candy), fmt(brewCost + reserve), fmt(reserve),fmt(candy),fmt(target))
+        elseif goal == 'Smart Event' and not smartAllowsBrew then
+            state.eventStatus = ('Witch: prioritising Reaper %s/%s; next optional brew after %s candy gained')
+                :format(fmt(candy),fmt(target),fmt(nextBrew))
         else
-            state.eventFailures = math.min(5, state.eventFailures + 1)
-            state.eventNextTryAt = now() + math.min(90, 6 * 2 ^ (state.eventFailures - 1))
-            state.eventStatus = 'Cauldron rejected request; cooling down'
+            state.eventStatus = ('Saving for Reaper %s/%s (remaining set %s)')
+                :format(fmt(candy),fmt(target),fmt(wantedTotal))
         end
         return
     end
-    state.eventStatus = not eventNeedsBrew(inv) and 'Mummy Wraps + Pumpkin King obtained; brew complete'
-        or (missing == 0 and 'Reaper complete; event goals reached' or
-           ('Saving event gear (%d pieces remaining)'):format(missing))
+    if wantsBrew then
+        state.eventStatus = ('Cauldron saving %s/%s candy (includes %s reserve)')
+            :format(fmt(candy), fmt(brewCost + reserve), fmt(reserve))
+    else
+        state.eventStatus = 'Witch shop completed'
+    end
 end
+
 
 local gearWeights = {Cash=3, Drop=3, Luck=15, Double=2.5,
     Rebirth=2.5, Scrap=0.7, Speed=0.08}
@@ -1600,10 +1686,10 @@ toggle(extrasTab, 'Auto Obby Reward (Teleport)', 'AutoObby')
 extrasTab:CreateSection("Halloween · Witch's Hut")
 toggle(extrasTab, 'Auto Complete Halloween Event', 'AutoHalloweenEvent')
 dropdown(extrasTab, 'Halloween Goal', 'HalloweenGoal',
-    {'Set then Brew','Brew First','Set Only','Brew Only'})
+    {'Smart Event','Brew First','Set Only','Brew Only'})
 toggle(extrasTab, 'Wear Reaper Set for +40% Candy', 'WearReaperSet')
 toggle(extrasTab, 'Stop When Both Rare + Crown Are Owned', 'StopBrewAfterCrown')
-slider(extrasTab, 'Keep Candy Reserve for Brews', 'CandyReserve', 0, 500, 25)
+slider(extrasTab, 'Candy Reserve (0 = Brew Sooner)', 'CandyReserve', 0, 500, 25)
 local eventLabel = extrasTab:CreateLabel('Halloween: waiting for candy and gear')
 extrasTab:CreateSection('UPD 4 · Hiring Agency')
 toggle(extrasTab, 'Auto Workers (50 Rebirths)', 'AutoWorkers')
@@ -1815,8 +1901,21 @@ local function runFastRewards()
     end
 end
 
+-- Separate event worker: ordinary upgrades, inventory processing and Workers
+-- must not block free candy/cauldron decisions behind eight other loops.
+local function runHalloween()
+    while state.alive do
+        local ok, err = pcall(halloweenTick)
+        if not ok then
+            state.eventStatus = 'Witch error: ' .. tostring(err):sub(1, 110)
+            state.lastError = tostring(err)
+            warn('[PuckAFK TBOD][Halloween] ' .. tostring(err))
+        end
+        task.wait(0.95)
+    end
+end
 local function runMaintenance()
-    local loops = {buyPerk, workerTick, questTick, codesTick, autoGear, caseTick, halloweenTick, salvageTick}
+    local loops = {buyPerk, workerTick, questTick, codesTick, autoGear, caseTick, salvageTick}
     local index = 0
     while state.alive do
         index = index % #loops + 1
@@ -1882,7 +1981,8 @@ end
 task.spawn(runFarm)
 task.spawn(runFastRewards)
 task.spawn(runMaintenance)
+task.spawn(runHalloween)
 task.spawn(runGearRefresh)
 task.spawn(runWorkerRefresh)
 task.spawn(runStatus)
-notify("v1.9.1 UPD 4 | core recovery, rebirth/pad fixes, reliable gear collection")
+notify("v1.9.2 UPD 4 | Witch brewing fixed + event worker + smart candy budget")

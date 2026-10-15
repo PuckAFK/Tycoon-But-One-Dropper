@@ -30,17 +30,22 @@ local state = {
     padAcks = {}, padFailures = {}, worldAcks = {}, lastPlot = nil,
     rpcBusy = false, nextRpc = 0, rpcErrors = {},
     gear = nil, gearDirty = true, lastRebirthCount = tonumber(LocalPlayer:GetAttribute('Rebirths')) or 0,
-    counters = {purchases = 0, rebirths = 0, quests = 0, gears = 0, crates = 0, perks = 0, cases = 0},
+    counters = {purchases = 0, rebirths = 0, quests = 0, gears = 0, crates = 0, perks = 0, cases = 0, obby = 0, spins = 0},
     gearSnapshotAt = 0, caseDecision = 'Waiting for gear data',
     lastCaseOpenedAt = 0, caseFailures = 0,
+    extrasUntil = 0, nextExtrasAt = 0, extrasCycles = 0,
+    obbyNextTryAt = 0, obbyFailures = 0, obbyLastReward = 0,
+    obbyStatus = 'Not attempted', obbyAckAt = 0, wheelFailures = 0,
     status = 'Initialising', lastError = '',
 }
 Env.PuckTBOD31 = state
 
 local opts = {
-    AutoFarm = true, AutoRebirth = true, AutoPerks = true,
+    AutoFarm = true, AutoBuyPads = true, ActivityPriority = 'Balanced',
+    ExtrasInterval = 22, AutoObby = true,
+    AutoRebirth = true, AutoPerks = true,
     AutoRewards = true, AutoQuests = true, AutoCodes = true, AutoGroupReward = true,
-    AutoLostGears = false, AutoCrates = true, AutoPails = true,
+    AutoLostGears = true, AutoCrates = true, AutoPails = true,
     AutoHalloweenGear = true, AutoBrew = false, CandyReserve = 100,
     AutoEquipGear = true, AutoImproveGear = true, AutoFuseGear = true,
     AutoCases = true,
@@ -48,7 +53,7 @@ local opts = {
     RebirthMode = 'Fast', BuyMode = 'Balanced',
     Movement = 'Instant', TweenSpeed = 175,
     PadDelay = 28, ReservePercent = 0,
-    UseTouchInterest = true, AutoSalvage = false, MaxCollectibleDetour = 240,
+    UseTouchInterest = true, AutoSalvage = false, MaxCollectibleDetour = 1000,
 }
 
 local function fmt(n)
@@ -277,6 +282,7 @@ local function getBestPad(plot, cash, income)
 end
 
 local function buyPad(plot, candidate)
+    if not opts.AutoBuyPads or opts.ActivityPriority == 'Extras Only' then return false end
     if not candidate or not candidate.part or not candidate.part.Parent then return false end
     if not plot or findPlot() ~= plot then return false end
     local part, id = candidate.part, candidate.id
@@ -294,7 +300,7 @@ local function buyPad(plot, candidate)
     local top = part.Position + Vector3.new(0, part.Size.Y * 0.5, 0)
     if not moveNear(top, 2, 2.5) then return false end
     local _, root = humanoidParts()
-    if not root or not state.alive or not part.Parent then return false end
+    if not root or not state.alive or not opts.AutoBuyPads or opts.ActivityPriority == 'Extras Only' or not part.Parent then return false end
     -- The game's server accepts pad touches; we do not invent a BuyPad action.
     if opts.UseTouchInterest and type(firetouchinterest) == 'function' then
         pcall(function()
@@ -446,9 +452,22 @@ local function rewardsTick()
             end
         end
     end
-    if nattr('WheelSpins') > 0 and ready('spin', 2.5) then
+    -- Client wheel UI allows a *free* spin after WheelNext, even if
+    -- WheelSpins is zero. v1.3 ignored this and skipped recurring free spins.
+    local wheelNext = nattr('WheelNext')
+    local freeSpinReady = wheelNext <= workspace:GetServerTimeNow()
+    if nattr('Income') > 0 and (nattr('WheelSpins') > 0 or freeSpinReady)
+        and ready('spin', 2.5) then
         local result = rpc('Spin')
-        if result.ok then say('Used free wheel spin') end
+        if result.ok then
+            state.wheelFailures = 0
+            state.counters.spins = state.counters.spins + 1
+            say('Collected free wheel spin')
+        else
+            -- Avoid repeatedly invoking when the server rejects an early spin.
+            state.wheelFailures = math.min(6, state.wheelFailures + 1)
+            state.throttles.spin = now() + math.min(80, 4 * (2 ^ (state.wheelFailures - 1)))
+        end
     end
 end
 local function codesTick()
@@ -563,6 +582,91 @@ local function worldTick(allowGear, maxDetour)
         state.worldAttempts[target.key] = now() + (target.kind == 'gear' and 13 or 8)
     end
     return succeeded
+end
+
+-- Obby markers were confirmed in the uploaded RBXL as AttributesSerialize
+-- `ObbyReward = true` (two tower reward pads); ObbyNext is player cooldown.
+-- The server is authoritative. A teleport or client touch is NOT proof of reward.
+local function obbyRewardPart()
+    local world = workspace:FindFirstChild('World')
+    local obby = world and world:FindFirstChild('Obby')
+    if not obby then return nil end
+    local _, root = humanoidParts()
+    if not root then return nil end
+    local best, bestCost = nil, math.huge
+    for _, obj in ipairs(obby:GetDescendants()) do
+        if obj:IsA('BasePart') and obj:GetAttribute('ObbyReward') == true then
+            -- Two reward triggers exist; favor nearby eligible finish pads.
+            local travel = (root.Position - obj.Position).Magnitude
+            local cost = travel + (obj.CanTouch and 0 or 100)
+            if cost < bestCost then best, bestCost = obj, cost end
+        end
+    end
+    return best
+end
+
+local function obbyTick()
+    if not opts.AutoObby or not state.alive or not canGo() or state.moving
+        or now() < state.obbyNextTryAt then return false end
+    local serverTime = workspace:GetServerTimeNow()
+    local oldNext = nattr('ObbyNext')
+    local oldAck = state.obbyAckAt or 0
+    if oldNext > serverTime + 1 then
+        state.obbyStatus = 'Cooldown ' .. tostring(math.ceil(oldNext - serverTime)) .. 's'
+        state.obbyNextTryAt = now() + math.min(30, math.max(3, oldNext - serverTime - 1))
+        return false
+    end
+    local reward = obbyRewardPart()
+    if not reward then
+        state.obbyStatus = 'Reward trigger not streamed in'
+        state.obbyNextTryAt = now() + 20
+        return false
+    end
+    -- Directly reach the ObbyReward platform. Never target an arbitrary tallest
+    -- decoration, which can be above the real reward pad.
+    state.obbyStatus = 'Teleporting to reward'
+    say('Obby: visiting finish reward')
+    state.obbyNextTryAt = now() + 10
+    local target = reward.Position + Vector3.new(0, reward.Size.Y * 0.5, 0)
+    if not moveNear(target, 3, 2.1) then
+        state.obbyStatus = 'Cannot reach reward'
+        state.obbyNextTryAt = now() + 30
+        return true
+    end
+    if not state.alive or not reward.Parent then return true end
+    local _, root = humanoidParts()
+    if not root then return true end
+    -- A normal short contact plus touch fallback, with no invented reward RPC.
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.CFrame = CFrame.new(reward.Position + Vector3.new(0, math.min(2.2, reward.Size.Y * 0.5 + 1.4), 0))
+    if opts.UseTouchInterest and type(firetouchinterest) == 'function' then
+        pcall(function()
+            firetouchinterest(root, reward, 0)
+            task.wait(0.06)
+            if state.alive and reward.Parent then firetouchinterest(root, reward, 1) end
+        end)
+    end
+    local deadline = now() + 2.4
+    while state.alive and now() < deadline do
+        if (state.obbyAckAt or 0) > oldAck or
+            nattr('ObbyNext') > math.max(oldNext, serverTime) + 1 then break end
+        task.wait(0.12)
+    end
+    local rewarded = (state.obbyAckAt or 0) > oldAck or
+        nattr('ObbyNext') > math.max(oldNext, serverTime) + 1
+    if rewarded then
+        state.counters.obby = state.counters.obby + 1
+        state.obbyFailures = 0
+        state.obbyLastReward = now()
+        state.obbyStatus = 'Reward collected'
+        state.obbyNextTryAt = now() + 10
+        say('Obby reward claimed')
+    else
+        state.obbyFailures = math.min(5, state.obbyFailures + 1)
+        state.obbyNextTryAt = now() + math.min(180, 15 * 2 ^ (state.obbyFailures - 1))
+        state.obbyStatus = 'No server confirmation; retry later'
+    end
+    return true
 end
 
 local function halloweenTick()
@@ -872,6 +976,9 @@ if Net and Net:IsA('RemoteEvent') then
         elseif event == 'PailGone' and type(data) == 'table' and data.Got then
             state.worldAcks.pail = now()
             state.worldAttempts.pail = now() + 10
+        elseif event == 'Obby' then
+            -- Actual reward broadcast: UI shows cash and 2x multiplier bonus.
+            state.obbyAckAt = now()
         elseif event == 'Rebirthed' then
             state.lastRebirth = now()
             table.clear(state.failures)
@@ -928,6 +1035,9 @@ local function slider(tab, title, key, min, max, increment)
 end
 
 toggle(farmTab, 'Smart Autofarm', 'AutoFarm')
+toggle(farmTab, 'Auto Buy Upgrade Pads', 'AutoBuyPads')
+dropdown(farmTab, 'Farming Focus', 'ActivityPriority',
+    {'Balanced','Extras First','Upgrades First','Extras Only'})
 toggle(farmTab, 'Automatic Rebirths', 'AutoRebirth')
 toggle(farmTab, 'Buy Permanent Perks', 'AutoPerks')
 dropdown(farmTab, 'Upgrade Priority', 'BuyMode', {'Balanced','Cheapest','Highest Value'})
@@ -945,7 +1055,8 @@ toggle(extrasTab, 'Group Cash (Existing Members)', 'AutoGroupReward')
 extrasTab:CreateSection('World Collectibles')
 toggle(extrasTab, 'Collect Mystery Crates', 'AutoCrates')
 toggle(extrasTab, 'Collect Halloween Candy Pails', 'AutoPails')
-toggle(extrasTab, 'Hunt Lost Gears (Slower Farm)', 'AutoLostGears')
+toggle(extrasTab, 'Hunt Lost Gears', 'AutoLostGears')
+toggle(extrasTab, 'Auto Obby Reward (Teleport)', 'AutoObby')
 extrasTab:CreateSection('Halloween Event')
 toggle(extrasTab, 'Buy Unowned Event Gear', 'AutoHalloweenGear')
 toggle(extrasTab, 'Brew With Extra Candy', 'AutoBrew')
@@ -959,6 +1070,7 @@ toggle(extrasTab, 'Salvage Excess Copies (Optional)', 'AutoSalvage')
 dropdown(extrasTab, 'Toolbox Strategy', 'CaseType', {'Smart','Scrap','Forge'})
 slider(extrasTab, 'Keep Scrap Reserve for Cases', 'CaseReserve', 0, 500, 5)
 local caseLabel = extrasTab:CreateLabel('Toolboxes: waiting for inventory')
+local obbyLabel = extrasTab:CreateLabel('Obby: waiting for reward status')
 
 settingsTab:CreateSection('Movement + Speed')
 dropdown(settingsTab, 'Movement Mode', 'Movement', {'Instant','Tween'})
@@ -969,6 +1081,7 @@ slider(settingsTab, 'Purchase Check Delay (x100)', 'PadDelay', 12, 100, 4)
 toggle(settingsTab, 'Touch Interest Fallback', 'UseTouchInterest')
 slider(settingsTab, 'Cash Reserve Percent', 'ReservePercent', 0, 75, 5)
 slider(settingsTab, 'Maximum Collectible Detour', 'MaxCollectibleDetour', 80, 1800, 20)
+slider(settingsTab, 'Extras Check Interval (Seconds)', 'ExtrasInterval', 10, 120, 2)
 settingsTab:CreateSection('Management')
 settingsTab:CreateLabel('Configs tab supports autosave, autoload, profiles and JSON export/import.')
 settingsTab:CreateLabel('No gamepasses or Robux purchase prompts are used.')
@@ -993,6 +1106,30 @@ win:SetCloseCallback(unload)
 -- the boolean/numeric/dropdown options above and deliberately never uploads config.
 -- PuckUI automatically generates its complete Configs tab.
 
+-- Guaranteed activity windows prevent continuous affordable pad purchasing
+-- from starving Obby, Lost Gears and crate/pail collection indefinitely.
+-- Maintenance (wheel, quests, gear, toolboxes) continues in its own worker.
+local function extrasWorkTick()
+    if not state.alive or not canGo() then return false end
+    if opts.AutoObby and obbyTick() then return true end
+    if worldTick(true, opts.MaxCollectibleDetour) then return true end
+    return false
+end
+
+local function extrasActive()
+    local mode = opts.ActivityPriority
+    if not opts.AutoBuyPads or mode == 'Extras Only' then return true end
+    local interval = math.clamp(tonumber(opts.ExtrasInterval) or 22, 10, 120)
+    if state.nextExtrasAt == 0 then state.nextExtrasAt = now() + math.min(8, interval * 0.5) end
+    if now() >= state.nextExtrasAt and now() >= state.extrasUntil then
+        local window = mode == 'Extras First' and 13 or mode == 'Upgrades First' and 4 or 8
+        state.extrasUntil = now() + window
+        state.nextExtrasAt = state.extrasUntil + interval
+        state.extrasCycles = state.extrasCycles + 1
+    end
+    return now() < state.extrasUntil
+end
+
 local function runFarm()
     while state.alive do
         local ok, err = pcall(function()
@@ -1001,21 +1138,32 @@ local function runFarm()
                 task.wait(0.45)
                 return
             end
+            if not canGo() then
+                say('Waiting for character respawn')
+                task.wait(0.6)
+                return
+            end
+            if state.busyUntil > now() then task.wait(0.08); return end
+            local focus = extrasActive()
+            if focus then
+                if rebirthTick() then return end
+                if extrasWorkTick() then return end
+                if not opts.AutoBuyPads or opts.ActivityPriority == 'Extras Only' then
+                    say('Extras only: upgrades disabled; watching rewards + collectibles')
+                else
+                    say('Extras window: checking rewards + collectibles')
+                end
+                task.wait(0.35)
+                return
+            end
             local plot = findPlot()
             if not plot then
                 say('Waiting for owned plot')
                 task.wait(1.2)
                 return
             end
-            if state.busyUntil > now() then task.wait(0.08); return end
-            if not canGo() then
-                say('Waiting for character respawn')
-                task.wait(0.6)
-                return
-            end
             if rebirthTick() then return end
-            -- Only detour for a crate/pail during normal upgrade progression
-            -- if it is genuinely nearby. Longer hunts wait for an income stall.
+            -- Grab nearby temporary pickups while heading towards the next pad.
             if worldTick(false, 60) then return end
             if opts.AutoRebirth then
                 local rebirthCost = nattr('RebirthCost')
@@ -1047,7 +1195,7 @@ local function runFarm()
                     task.wait(0.28)
                     return
                 end
-                if worldTick(count == 0 or nextPrice > cash * 3, opts.MaxCollectibleDetour) then return end
+                if worldTick(true, opts.MaxCollectibleDetour) then return end
                 if count == 0 then
                     say(buildRemaining > 0 and ('Waiting for build: ' .. math.ceil(buildRemaining) .. 's') or
                         'All current upgrade pads complete; awaiting rebirth')
@@ -1102,13 +1250,14 @@ local function runStatus()
             if state.lastError ~= '' then title = title .. ' | Last error: ' .. state.lastError:sub(1, 35) end
             if stateLabel then stateLabel:Set(title) end
             if statsLabel then
-                statsLabel:Set(string.format('Pads %d  |  Rebirths %s  |  Quests %d  |  Gears %d',
-                    state.counters.purchases, fmt(nattr('Rebirths')), state.counters.quests, state.counters.gears))
+                statsLabel:Set(string.format('Pads %d  |  Rebirths %s  |  Spins %d  |  Gears %d  |  Obby %d',
+                    state.counters.purchases, fmt(nattr('Rebirths')), state.counters.spins, state.counters.gears, state.counters.obby))
             end
             if walletLabel then
                 walletLabel:Set(string.format('Cash $%s  |  Income $%s/s  |  Tokens %s',
                     fmt(nattr('Cash')), fmt(nattr('Income')), fmt(nattr('Tokens'))))
             end
+            if obbyLabel then obbyLabel:Set('Obby: ' .. tostring(state.obbyStatus)) end
             if caseLabel then
                 caseLabel:Set(string.format('Scrap %s  |  Cases %d  |  %s',
                     fmt(nattr('Scrap')), state.counters.cases, state.caseDecision or 'Idle'))
@@ -1125,4 +1274,4 @@ task.spawn(runFarm)
 task.spawn(runMaintenance)
 task.spawn(runGearRefresh)
 task.spawn(runStatus)
-notify('v1.3 loaded | smart Scrap/Forge toolboxes + equipment upgrades + no Robux purchases')
+notify('v1.4 loaded | auto Obby + free spins + priority extras + pad purchase toggle')

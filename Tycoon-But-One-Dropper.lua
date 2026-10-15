@@ -29,6 +29,7 @@ local state = {
     padConfirmed = false, lastBoughtAt = 0, lastGearRefresh = 0,
     padAcks = {}, padFailures = {}, worldAcks = {}, lastPlot = nil,
     rpcBusy = false, nextRpc = 0, rpcErrors = {},
+    rpcActiveToken = 0, rpcBusySince = 0, rpcPending = 0, rpcRecoveries = 0,
     gear = nil, gearDirty = true, lastRebirthCount = tonumber(LocalPlayer:GetAttribute('Rebirths')) or 0,
     counters = {purchases = 0, rebirths = 0, quests = 0, gears = 0, crates = 0, perks = 0, cases = 0, obby = 0, spins = 0},
     gearSnapshotAt = 0, caseDecision = 'Waiting for gear data',
@@ -38,6 +39,7 @@ local state = {
     obbyStatus = 'Not attempted', obbyAckAt = 0, wheelFailures = 0,
     lastGearAttempt = 0, lastWorldActivity = 0, nextIdleCollectAt = 0,
     lastPrioritySwitchAt = 0, idleSince = 0, fallbackCount = 0,
+    pickupFailures = {}, idleSkippedExtras = 0, extrasJobs = 0,
     status = 'Initialising', lastError = '',
 }
 Env.PuckTBOD31 = state
@@ -52,7 +54,7 @@ local opts = {
     AutoEquipGear = true, AutoImproveGear = true, AutoFuseGear = true,
     AutoCases = true,
     CaseType = 'Smart', CaseReserve = 20,
-    RebirthMode = 'Fast', BuyMode = 'Balanced',
+    RebirthMode = 'Smart', BuyMode = 'Balanced',
     Movement = 'Instant', TweenSpeed = 175,
     PadDelay = 28, ReservePercent = 0,
     UseTouchInterest = true, AutoSalvage = false, MaxCollectibleDetour = 1000,
@@ -90,32 +92,51 @@ local function ready(key, delay)
 end
 -- Serialised server actions: avoids unrelated maintenance workers spamming
 -- the same RemoteFunction on top of each other.
+-- Bounded single-flight RPC. If InvokeServer never returns, a stale request
+-- must not permanently freeze every reward, perk and gear operation. The
+-- watchdog permits at most two outstanding requests, and obsolete replies
+-- cannot clear a newer request's lock.
 local function rpc(key, ...)
     if not state.alive then return {ok = false, msg = 'Unloaded'} end
     local args = table.pack(...)
-    local waitUntil = now() + 1.4
+    if state.rpcBusy and (now() - state.rpcBusySince) > 9 and state.rpcPending < 2 then
+        state.rpcBusy = false
+        state.rpcRecoveries = state.rpcRecoveries + 1
+        state.lastError = 'Recovered stalled server action'
+    end
+    local waitUntil = now() + 0.85
     while state.alive and state.rpcBusy and now() < waitUntil do task.wait(0.035) end
     if not state.alive then return {ok = false, msg = 'Unloaded'} end
-    if state.rpcBusy then return {ok = false, msg = 'Action busy'} end
+    if state.rpcBusy or state.rpcPending >= 2 then
+        return {ok = false, msg = 'Server actions busy; retry later'}
+    end
     state.rpcBusy = true
-    local waitFor = math.max(0, state.nextRpc - now())
-    if waitFor > 0 then task.wait(math.min(waitFor, 1.25)) end
-    if not state.alive then state.rpcBusy = false return {ok = false, msg = 'Unloaded'} end
-    -- InvokeServer has no cancellation API. Run its request in a separate
-    -- task so a stalled server reply cannot freeze the farm worker forever.
-    -- Keep the action lock until that request *actually* finishes.
+    state.rpcBusySince = now()
+    state.rpcActiveToken = state.rpcActiveToken + 1
+    local token = state.rpcActiveToken
+    local waitUntilThrottle = now() + 4
+    while state.alive and now() < state.nextRpc and now() < waitUntilThrottle do
+        task.wait(0.04)
+    end
+    if not state.alive or now() < state.nextRpc then
+        if state.rpcActiveToken == token then state.rpcBusy = false end
+        return {ok = false, msg = 'Server action cooling down'}
+    end
     local finished, worked, result = false, false, nil
+    state.rpcPending = state.rpcPending + 1
     task.spawn(function()
         worked, result = pcall(function()
             return Action:InvokeServer(key, table.unpack(args, 1, args.n))
         end)
         finished = true
-        state.rpcBusy = false
+        state.rpcPending = math.max(0, state.rpcPending - 1)
+        if state.rpcActiveToken == token then state.rpcBusy = false end
     end)
-    local deadline = now() + 4.0
+    local deadline = now() + 4
     while state.alive and not finished and now() < deadline do task.wait(0.045) end
     if not finished then
         state.lastError = 'Slow server response: ' .. tostring(key)
+        state.nextRpc = math.max(state.nextRpc, now() + 0.8)
         return {ok = false, msg = 'Timed out waiting for ' .. tostring(key)}
     end
     if not worked then
@@ -125,7 +146,7 @@ local function rpc(key, ...)
     end
     local normalized = type(result) == 'table' and result or {ok = result == true, result = result}
     if normalized.msg == 'slow down' then
-        state.nextRpc = now() + 0.65
+        state.nextRpc = now() + 0.8
     else
         state.nextRpc = now() + 0.16
     end
@@ -393,6 +414,14 @@ end
 local function rebirthMultiplier()
     if opts.RebirthMode == 'Extra Tokens' then return 4 end
     if opts.RebirthMode == 'Balanced' then return 2 end
+    if opts.RebirthMode ~= 'Smart' then return 1 end
+    -- Adaptive: only wait for bonus token thresholds if passive production
+    -- can reach them quickly. Otherwise rebirth now and unlock the next run.
+    local cost, cash, income = nattr('RebirthCost'), nattr('Cash'), nattr('Income')
+    if cost <= 0 or cash < cost then return 1 end
+    if income <= 0 then return 1 end
+    if (4 * cost - cash) / income <= 18 then return 4 end
+    if (2 * cost - cash) / income <= 9 then return 2 end
     return 1
 end
 local function rebirthTick()
@@ -537,7 +566,7 @@ local function pickupCenter(model)
     return first and first.Position or model:GetPivot().Position
 end
 
-local function worldTarget(allowGear, maxDetour)
+local function worldTarget(allowGear, maxDetour, forceGear)
     if state.moving then return nil end
     local _, root = humanoidParts()
     if not root then return nil end
@@ -571,13 +600,14 @@ local function worldTarget(allowGear, maxDetour)
     end
     -- A continuous supply of crates can otherwise prevent lost-gear rounds.
     -- Give gears an explicit service slot every 12 seconds when available.
-    if gearChoice and now() - state.lastGearAttempt >= 12 then return gearChoice end
+    if forceGear then return gearChoice end
+    if gearChoice and now() - state.lastGearAttempt >= 10 then return gearChoice end
     return best
 end
 
-local function worldTick(allowGear, maxDetour)
+local function worldTick(allowGear, maxDetour, forceGear)
     if not state.alive or not canGo() or now() < state.busyUntil then return false end
-    local target = worldTarget(allowGear, maxDetour)
+    local target = worldTarget(allowGear, maxDetour, forceGear)
     if not target then return false end
     if target.kind == 'gear' then state.lastGearAttempt = now() end
     local delay = target.kind == 'gear' and 4 or 3
@@ -587,8 +617,10 @@ local function worldTick(allowGear, maxDetour)
     local ackBefore = state.worldAcks[target.key] or 0
     local moved = moveNear(target.pos, 4.5, 1.1)
     if not moved then
-        state.worldAttempts[target.key] = now() + 12
-        return true -- an attempted activity consumes its slot; don't immediately fight another worker
+        local failures = math.min(5, (state.pickupFailures[target.key] or 0) + 1)
+        state.pickupFailures[target.key] = failures
+        state.worldAttempts[target.key] = now() + math.min(120, 8 * 2 ^ (failures - 1))
+        return true -- failed movement backs off; try another activity
     end
     local succeeded = false
     if target.kind == 'gear' then
@@ -606,9 +638,12 @@ local function worldTick(allowGear, maxDetour)
                 -- An accepted gear stays visually visible on some clients.
                 -- Wait for refreshed GearData, or a new collection round.
                 state.worldAttempts[target.key] = now() + 90
+                state.pickupFailures[target.key] = nil
                 say('Collected lost gear #' .. tostring(target.index))
             else
-                state.worldAttempts[target.key] = now() + 18
+                local failures = math.min(5, (state.pickupFailures[target.key] or 0) + 1)
+                state.pickupFailures[target.key] = failures
+                state.worldAttempts[target.key] = now() + math.min(180, 12 * 2 ^ (failures - 1))
             end
         end
     else
@@ -620,8 +655,16 @@ local function worldTick(allowGear, maxDetour)
             task.wait(0.10)
         until now() >= deadline
         succeeded = (state.worldAcks[target.key] or 0) > ackBefore
-        state.worldAttempts[target.key] = now() + (succeeded and 5 or 9)
+        if succeeded then
+            state.pickupFailures[target.key] = nil
+            state.worldAttempts[target.key] = now() + 6
+        else
+            local failures = math.min(4, (state.pickupFailures[target.key] or 0) + 1)
+            state.pickupFailures[target.key] = failures
+            state.worldAttempts[target.key] = now() + math.min(90, 7 * 2 ^ (failures - 1))
+        end
     end
+    if succeeded then state.extrasJobs = state.extrasJobs + 1 end
     state.lastWorldActivity = now()
     return true -- an attempted collectible trip is useful work, including failed/denied trips
 end
@@ -963,6 +1006,35 @@ local function decideToolbox()
     return case, reason
 end
 
+-- Spend scrap on a useful equipped-gear upgrade before opening another
+-- toolbox. A constant CaseReserve by itself can otherwise keep a player
+-- permanently below their next upgrade/fusion cost.
+local function smartScrapReserve()
+    if not (opts.AutoImproveGear or opts.AutoFuseGear) then return 0 end
+    local d = state.gear
+    if not d or type(d.I) ~= 'table' or type(d.E) ~= 'table' then return 0 end
+    local goal = math.huge
+    for _, slot in ipairs(Gear.Slots) do
+        local id = d.E[slot.Key]
+        local item = id and Gear.ById[id]
+        local row = id and d.I[id]
+        if item and type(row) == 'table' then
+            local level, tier, copies = tonumber(row.L) or 1, tonumber(row.T) or 1, tonumber(row.C) or 0
+            if opts.AutoImproveGear and level < Gear.MaxLevel and
+                copies >= (Gear.NeedsCopies(item) and 1 or 0) then
+                goal = math.min(goal, tonumber(Gear.UpgradeCost(item, level)) or math.huge)
+            end
+            if opts.AutoFuseGear and tier < #Gear.TierMult and level >= Gear.MaxLevel and
+                copies >= (Gear.NeedsCopies(item) and Gear.FuseCopiesFor(item) or 0) then
+                goal = math.min(goal, tonumber(Gear.FuseCost(item, tier)) or math.huge)
+            end
+        end
+    end
+    -- Very expensive future upgrades shouldn't halt every toolbox forever.
+    if goal < math.huge and goal <= 2000 then return goal end
+    return 0
+end
+
 local function caseTick()
     if not opts.AutoCases or not ready('case-check', 2) then return end
     -- Never buy from stale/missing inventory: a case can create a new item,
@@ -975,7 +1047,7 @@ local function caseTick()
     local case, reason = decideToolbox()
     if not case then state.caseDecision = reason; return end
     local scrap = nattr('Scrap')
-    local reserve = math.max(0, tonumber(opts.CaseReserve) or 0)
+    local reserve = math.max(0, tonumber(opts.CaseReserve) or 0, smartScrapReserve())
     local target = case.Cost + reserve
     if scrap < target then
         state.caseDecision = string.format('Save %d/%d Scrap for %s (%s)',
@@ -1095,7 +1167,7 @@ dropdown(farmTab, 'Farming Focus', 'ActivityPriority',
 toggle(farmTab, 'Automatic Rebirths', 'AutoRebirth')
 toggle(farmTab, 'Buy Permanent Perks', 'AutoPerks')
 dropdown(farmTab, 'Upgrade Priority', 'BuyMode', {'Balanced','Cheapest','Highest Value'})
-dropdown(farmTab, 'Rebirth Strategy', 'RebirthMode', {'Fast','Balanced','Extra Tokens'})
+dropdown(farmTab, 'Rebirth Strategy', 'RebirthMode', {'Smart','Fast','Balanced','Extra Tokens'})
 farmTab:CreateSection('Progress')
 local stateLabel = farmTab:CreateLabel('Finding your plot...')
 local statsLabel = farmTab:CreateLabel('Upgrades: 0 | Rebirths: 0')
@@ -1167,10 +1239,12 @@ win:SetCloseCallback(unload)
 -- This prevents repeated Saving / Waiting status loops from starving other tasks.
 local function extrasWorkTick()
     if not state.alive or not canGo() then return false end
-    -- Respect the actual ObbyNext cooldown and retry backoff.
+    -- Guarantee gear rounds; Obby cannot repeatedly preempt them. Spare
+    -- cycles still collect crates, pails and the available Obby reward.
+    if opts.AutoLostGears and now() - state.lastGearAttempt >= 10 and
+        worldTick(true, opts.MaxCollectibleDetour, true) then return true end
     if opts.AutoObby and obbyTick() then return true end
-    if worldTick(true, opts.MaxCollectibleDetour) then return true end
-    return false
+    return worldTick(true, opts.MaxCollectibleDetour)
 end
 
 local function extrasActive()
@@ -1221,11 +1295,19 @@ local function runFarm()
             if rebirthTick() then return end
             if extrasActive() then
                 if not extrasWorkTick() then
-                    -- Already checked extras this frame: don't scan twice.
                     state.nextIdleCollectAt = now() + 0.55
-                    local label = (not opts.AutoBuyPads or opts.ActivityPriority == 'Extras Only')
-                        and 'Extras only' or 'Extras priority window'
-                    idleToExtras(label)
+                    if opts.AutoBuyPads and opts.ActivityPriority ~= 'Extras Only' then
+                        -- No eligible pickups: release the extras window early.
+                        -- Keeping an empty time window would waste upgrades.
+                        state.extrasUntil = now()
+                        local interval = math.clamp(tonumber(opts.ExtrasInterval) or 15, 8, 30)
+                        state.nextExtrasAt = now() + math.max(4, interval * 0.6)
+                        state.idleSkippedExtras = state.idleSkippedExtras + 1
+                        say('No extras ready; returning to upgrades')
+                    else
+                        say('Monitoring gears, wheel, Obby and rewards')
+                        task.wait(0.24)
+                    end
                 end
                 return
             end
@@ -1362,4 +1444,4 @@ task.spawn(runFastRewards)
 task.spawn(runMaintenance)
 task.spawn(runGearRefresh)
 task.spawn(runStatus)
-notify('v1.5 loaded | non-idling priority scheduler + actual LostGear claims + extras fallback')
+notify('v1.6 loaded | adaptive rebirth + fair gear scheduler + no wasted extras windows')
